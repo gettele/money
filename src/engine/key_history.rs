@@ -37,6 +37,8 @@ struct RawAction {
     success: Option<bool>,
     #[serde(default)]
     details: Value,
+    #[serde(default)]
+    trace_external_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +58,10 @@ pub(super) struct KeyChangePage {
     pub(super) changes: Vec<KeyChange>,
     /// The number of actions the provider returned, including skipped ones.
     pub(super) raw_count: usize,
+    /// Rotations whose keys the provider left out, as an index into `changes`
+    /// and the hash of the external message that requested them. Those
+    /// entries are placeholders until the keys are read from that message.
+    pub(super) pending: Vec<(usize, String)>,
 }
 
 impl KeyChangePage {
@@ -99,8 +105,10 @@ pub(super) fn build_key_change_request(
 /// Failed rotations, other action types, and rotations of other wallets are
 /// skipped: an account filter also returns actions this wallet only relayed.
 /// Toncenter indexer v1.3 reports a rotation only together with its key-changed
-/// log, so a rotation of this wallet without both keys is a provider protocol
-/// error.
+/// log. Older indexers, such as the one Telegram proxies, report neither key;
+/// such a rotation is kept as a placeholder with its external message hash in
+/// `pending`. A rotation of this wallet with one key, or without both keys and
+/// without that hash, is a provider protocol error.
 pub(super) fn parse_key_change_page(
     body: &[u8],
     wallet: &TonAddressString,
@@ -109,6 +117,7 @@ pub(super) fn parse_key_change_page(
         .map_err(|error| invalid_response(format!("invalid key-change actions: {error}")))?;
     let raw_count = response.actions.len();
     let mut changes = Vec::new();
+    let mut pending = Vec::new();
     for action in response.actions {
         if action.kind != CHANGE_WALLET_KEY_ACTION || action.success != Some(true) {
             continue;
@@ -126,6 +135,17 @@ pub(super) fn parse_key_change_page(
         if destination.as_address() != wallet.as_address() {
             continue;
         }
+        if details.new_public_key.is_none()
+            && details.encrypted_old_private_key.is_none()
+            && let Some(message_hash) = action.trace_external_hash
+        {
+            pending.push((changes.len(), message_hash));
+            changes.push(KeyChange {
+                new_public_key: [0; 32],
+                encrypted_old_private_key: [0; 32],
+            });
+            continue;
+        }
         changes.push(KeyChange {
             new_public_key: parse_key_hex(details.new_public_key, "new_public_key")?,
             encrypted_old_private_key: parse_key_hex(
@@ -134,21 +154,176 @@ pub(super) fn parse_key_change_page(
             )?,
         });
     }
-    Ok(KeyChangePage { changes, raw_count })
+    Ok(KeyChangePage {
+        changes,
+        raw_count,
+        pending,
+    })
 }
 
+#[derive(Debug, Deserialize)]
+struct MessageTransactionsResponse {
+    #[serde(default)]
+    transactions: Vec<MessageTransaction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageTransaction {
+    account: String,
+    #[serde(default)]
+    in_msg: Option<InboundMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InboundMessage {
+    #[serde(default)]
+    message_content: Option<MessageContent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageContent {
+    #[serde(default)]
+    body: Option<String>,
+}
+
+/// Builds the lookup of the transaction a rotation request message started.
+pub(super) fn build_key_change_message_request(
+    config: &WalletClientConfig,
+    id: HttpRequestId,
+    message_hash: &str,
+) -> Result<HttpRequest, crate::WalletClientError> {
+    build_toncenter_v3_request(
+        config,
+        id,
+        "transactionsByMessage",
+        &[
+            ("msg_hash", message_hash),
+            ("direction", "in"),
+            ("limit", "1"),
+            ("offset", "0"),
+        ],
+    )
+}
+
+/// Reads one rotation's keys from the request the wallet executed.
+///
+/// The inbound body of this wallet's transaction is the signed change-key
+/// request: signature, opcode, wallet id, expiration, sequence number and the
+/// new public key, then the new key's proof and the encrypted old private key
+/// as its two references.
+pub(super) fn parse_key_change_message(
+    body: &[u8],
+    wallet: &TonAddressString,
+) -> Result<KeyChange, DomainError> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use ton::ton_core::cell::TonCell;
+    use ton::ton_core::traits::tlb::TLB as _;
+
+    let malformed = |what: &str| invalid_response(format!("key-change transaction: {what}"));
+    let response: MessageTransactionsResponse =
+        serde_json::from_slice(body).map_err(|error| malformed(&error.to_string()))?;
+    let transaction = response
+        .transactions
+        .into_iter()
+        .next()
+        .ok_or_else(|| malformed("not indexed yet"))?;
+    let account = TonAddressString::try_from(transaction.account)
+        .map_err(|_| malformed("invalid account"))?;
+    if account.as_address() != wallet.as_address() {
+        return Err(malformed("executed by another account"));
+    }
+    let request = transaction
+        .in_msg
+        .and_then(|message| message.message_content)
+        .and_then(|content| content.body)
+        .ok_or_else(|| malformed("no inbound body"))?;
+    let request = STANDARD
+        .decode(request.trim())
+        .map_err(|_| malformed("inbound body is not base64"))?;
+    let cell = TonCell::from_boc(request).map_err(|_| malformed("inbound body is not a BoC"))?;
+    let mut parser = cell.parser();
+    let read = || malformed("not a change-key request");
+    let _signature = parser.read_bits(512).map_err(|_| read())?;
+    let opcode = parser.read_num::<u32>(32).map_err(|_| read())?;
+    if opcode != CHANGE_KEY_EXTERNAL_OPCODE && opcode != CHANGE_KEY_INTERNAL_OPCODE {
+        return Err(read());
+    }
+    for _ in 0..3 {
+        let _field = parser.read_num::<u32>(32).map_err(|_| read())?;
+    }
+    let new_public_key =
+        <[u8; 32]>::try_from(parser.read_bits(256).map_err(|_| read())?).map_err(|_| read())?;
+    let _proof = parser.read_next_ref().map_err(|_| read())?;
+    let encrypted = parser.read_next_ref().map_err(|_| read())?;
+    let encrypted_old_private_key =
+        <[u8; 32]>::try_from(encrypted.parser().read_bits(256).map_err(|_| read())?)
+            .map_err(|_| read())?;
+    Ok(KeyChange {
+        new_public_key,
+        encrypted_old_private_key,
+    })
+}
+
+const CHANGE_KEY_EXTERNAL_OPCODE: u32 = 0xfbba_99c8;
+const CHANGE_KEY_INTERNAL_OPCODE: u32 = 0xfbba_99c7;
+
+/// Reads a 32-byte key of a `change_wallet_key` action.
+///
+/// Toncenter reports keys as 64 hex digits, while other indexer deployments,
+/// such as Telegram's proxied one, use standard or URL-safe base64 or a decimal
+/// integer. The values are public, so a rejected one is quoted in the error.
 fn parse_key_hex(value: Option<String>, field: &str) -> Result<[u8; 32], DomainError> {
-    let malformed = || invalid_response(format!("change_wallet_key {field} is not 32 hex bytes"));
-    let value = value.ok_or_else(malformed)?;
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(malformed());
+    let malformed = |value: &str| {
+        let shown = value.chars().take(100).collect::<String>();
+        invalid_response(format!(
+            "change_wallet_key {field} is not a 32-byte key: {shown:?}"
+        ))
+    };
+    let value = value.ok_or_else(|| malformed(""))?;
+    let trimmed = value.trim();
+    key_from_hex(trimmed)
+        .or_else(|| key_from_base64(trimmed))
+        .or_else(|| key_from_decimal(trimmed))
+        .ok_or_else(|| malformed(&value))
+}
+
+fn key_from_hex(value: &str) -> Option<[u8; 32]> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if digits.len() != 64 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
     }
     let mut bytes = [0_u8; 32];
-    for (byte, pair) in bytes.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
-        let pair = std::str::from_utf8(pair).map_err(|_| malformed())?;
-        *byte = u8::from_str_radix(pair, 16).map_err(|_| malformed())?;
+    for (byte, pair) in bytes.iter_mut().zip(digits.as_bytes().chunks_exact(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
     }
-    Ok(bytes)
+    Some(bytes)
+}
+
+fn key_from_base64(value: &str) -> Option<[u8; 32]> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+
+    let mut bytes = [0_u8; 48];
+    let len = [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
+        .iter()
+        .find_map(|engine| engine.decode_slice(value, &mut bytes).ok())?;
+    <[u8; 32]>::try_from(bytes.get(..len)?).ok()
+}
+
+fn key_from_decimal(value: &str) -> Option<[u8; 32]> {
+    if !(70..=78).contains(&value.len()) || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let number = num_bigint::BigUint::parse_bytes(value.as_bytes(), 10)?;
+    let digits = number.to_bytes_be();
+    let mut bytes = [0_u8; 32];
+    let start = bytes.len().checked_sub(digits.len())?;
+    bytes.get_mut(start..)?.copy_from_slice(&digits);
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -320,6 +495,167 @@ mod tests {
         ] {
             assert!(
                 parse_key_change_page(&body, &wallet()).is_err(),
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+
+    #[test]
+    fn keys_arrive_as_hex_base64_or_decimal() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+
+        let key = bytes(NEW_KEY);
+        let encrypted = bytes(ENCRYPTED);
+        let decimal = |value: &[u8; 32]| num_bigint::BigUint::from_bytes_be(value).to_str_radix(10);
+        let encodings = [
+            (
+                json!(format!("0x{NEW_KEY}")),
+                json!(ENCRYPTED.to_uppercase()),
+            ),
+            (
+                json!(STANDARD.encode(key)),
+                json!(URL_SAFE_NO_PAD.encode(encrypted)),
+            ),
+            (json!(decimal(&key)), json!(decimal(&encrypted))),
+        ];
+        for (new_public_key, encrypted_old_private_key) in encodings {
+            let page = parse_key_change_page(
+                &page(vec![rotation(
+                    WALLET,
+                    new_public_key.clone(),
+                    encrypted_old_private_key,
+                )]),
+                &wallet(),
+            )
+            .expect("the page parses");
+            assert_eq!(
+                page.changes,
+                vec![KeyChange {
+                    new_public_key: key,
+                    encrypted_old_private_key: encrypted,
+                }],
+                "{new_public_key}"
+            );
+        }
+
+        let error = parse_key_change_page(
+            &page(vec![rotation(WALLET, json!("12345"), json!(ENCRYPTED))]),
+            &wallet(),
+        )
+        .expect_err("a short number is no key");
+        assert!(
+            error.developer_message.contains("\"12345\""),
+            "{}",
+            error.developer_message
+        );
+    }
+
+    /// A signed change-key request body as base64, as an indexer reports it.
+    pub(crate) fn request_body(
+        new_public_key: [u8; 32],
+        encrypted: [u8; 32],
+        opcode: u32,
+    ) -> String {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        use ton::ton_core::cell::TonCell;
+        use ton::ton_core::traits::tlb::TLB as _;
+
+        let mut proof = TonCell::builder();
+        proof.write_bits([7_u8; 64], 512).expect("proof writes");
+        let mut old = TonCell::builder();
+        old.write_bits(encrypted, 256).expect("old key writes");
+        let mut request = TonCell::builder();
+        request
+            .write_bits([9_u8; 64], 512)
+            .expect("signature writes");
+        request.write_num(&opcode, 32).expect("opcode writes");
+        for field in [0x7fff_7f11_u32, 0x7100_0000, 3] {
+            request.write_num(&field, 32).expect("header writes");
+        }
+        request.write_bits(new_public_key, 256).expect("key writes");
+        request
+            .write_ref(proof.build().expect("proof builds"))
+            .expect("proof ref");
+        request
+            .write_ref(old.build().expect("old key builds"))
+            .expect("old key ref");
+        STANDARD.encode(
+            request
+                .build()
+                .expect("request builds")
+                .to_boc()
+                .expect("boc"),
+        )
+    }
+
+    pub(crate) fn transactions(account: &str, body: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "transactions": [{
+                "account": account,
+                "hash": "ybABMr+c9dJPt7wFMfUQyjd9HmweAIBz77Ym9Bh3M7Y=",
+                "lt": "99612240000002",
+                "in_msg": {
+                    "hash": "+kW8nTZkdkT6dkI2SfB9nxbiYoSYmTGIFjfa7veogkw=",
+                    "message_content": { "hash": "x", "body": body, "decoded": null }
+                }
+            }],
+            "address_book": {}
+        }))
+        .expect("transactions JSON")
+    }
+
+    #[test]
+    fn rotations_without_keys_wait_for_their_request_message() {
+        let mut keyless = action(
+            "change_wallet_key",
+            json!(true),
+            json!({ "source": null, "destination": WALLET }),
+        );
+        keyless["trace_external_hash"] = json!("+kW8nTZkdkT6dkI2SfB9nxbiYoSYmTGIFjfa7veogkw=");
+        let body = page(vec![
+            rotation(WALLET, json!(NEW_KEY), json!(ENCRYPTED)),
+            keyless,
+        ]);
+
+        let page = parse_key_change_page(&body, &wallet()).expect("page parses");
+
+        assert_eq!(page.changes.len(), 2);
+        assert_eq!(page.changes[0].new_public_key, bytes(NEW_KEY));
+        assert_eq!(
+            page.pending,
+            vec![(1, "+kW8nTZkdkT6dkI2SfB9nxbiYoSYmTGIFjfa7veogkw=".to_owned())]
+        );
+    }
+
+    #[test]
+    fn the_executed_request_gives_both_keys() {
+        let key = bytes(NEW_KEY);
+        let encrypted = bytes(ENCRYPTED);
+        for opcode in [CHANGE_KEY_EXTERNAL_OPCODE, CHANGE_KEY_INTERNAL_OPCODE] {
+            let body = transactions(WALLET, &request_body(key, encrypted, opcode));
+            assert_eq!(
+                parse_key_change_message(&body, &wallet()).expect("request parses"),
+                KeyChange {
+                    new_public_key: key,
+                    encrypted_old_private_key: encrypted,
+                }
+            );
+        }
+
+        for body in [
+            transactions(
+                RELAYER,
+                &request_body(key, encrypted, CHANGE_KEY_EXTERNAL_OPCODE),
+            ),
+            transactions(WALLET, &request_body(key, encrypted, 0x0f8a_7ea5)),
+            transactions(WALLET, "not base64!"),
+            serde_json::to_vec(&json!({ "transactions": [] })).expect("JSON"),
+        ] {
+            assert!(
+                parse_key_change_message(&body, &wallet()).is_err(),
                 "{}",
                 String::from_utf8_lossy(&body)
             );

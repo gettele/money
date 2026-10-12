@@ -1,6 +1,7 @@
 //! Explicit encrypted-comment preparation and decryption workflows.
 
 use ed25519_dalek::SigningKey;
+use zeroize::Zeroizing;
 
 use crate::domain::{SecretAccessReason, bounded_diagnostic};
 use crate::transport::build_toncenter_v2_request;
@@ -10,16 +11,18 @@ use crate::wallet::encrypted_comment::{
     encrypt_comment as encrypt_body, validate_encrypted_comment_body,
 };
 use crate::wallet::key_history::{KeyChange, recover_signing_keys};
+use crate::wallet::private_key::{RotatedSecretError, rotated_secret, signing_half};
 use crate::wallet::recipient_public_key::verify_recipient_public_key;
 use crate::{
     AccountStatus, Boc, CreateEncryptedCommentRequest, DecryptCommentRequest,
-    EncryptedCommentRecipientRequest, HttpRequest, Network, ProtectedSecretRead, TonAddressString,
-    WalletClientConfig, WalletClientError,
+    EncryptedCommentRecipientRequest, HttpRequest, Network, ProtectedSecretRead, RecoveryPhrase,
+    TonAddressString, WalletClientConfig, WalletClientError,
 };
 
 use super::WalletClient;
 use super::key_history::{
-    MAX_KEY_CHANGE_PAGES, build_key_change_request, history_reaches, parse_key_change_page,
+    MAX_KEY_CHANGE_PAGES, build_key_change_message_request, build_key_change_request,
+    history_reaches, parse_key_change_message, parse_key_change_page,
 };
 use super::provider::parse_account;
 use super::send_http::{PublicKeyAnswer, build_public_key_request, parse_public_key};
@@ -274,6 +277,75 @@ impl WalletClient {
     }
 }
 
+#[uniffi::export]
+impl WalletClient {
+    /// Rebuilds a rotated wallet's secret from the 12 words its latest key
+    /// rotation installed, without the phrase or private key that created it.
+    ///
+    /// Configure the client with the wallet's address and, as its public key,
+    /// the key of these words (`rotation_mnemonic_public_key`); no protected
+    /// secret is needed. Every rotation publishes the key it replaced,
+    /// encrypted with the key it installs, and before the first rotation the
+    /// signing key is the anchor key. The engine reads the wallet's
+    /// `change_wallet_key` actions from Toncenter v3, walks them back from the
+    /// key of the words to the anchor key, and checks that the anchor opens
+    /// the configured address. The result is a private-key secret, the anchor
+    /// key followed by the words, ready for `import_wallet`. A wallet that
+    /// never rotated has no such history: import its own words or key instead.
+    ///
+    /// `InvalidProtectedSecret` means the words are not one valid 12-word half.
+    /// `EncryptedCommentLookupFailed` means the provider did not answer or its
+    /// history does not contain a rotation to these words; a retry can succeed.
+    /// `WalletIdentityMismatch` means a later rotation replaced these words or
+    /// the history leads to another wallet.
+    pub async fn recover_wallet_secret(
+        &self,
+        words: Vec<String>,
+    ) -> Result<RecoveryPhrase, WalletClientError> {
+        let words = Zeroizing::new(words);
+        let (half, signing) =
+            signing_half(&words).ok_or(WalletClientError::InvalidProtectedSecret)?;
+        let (generation, config) = {
+            let mut state = self.lock()?;
+            ensure_running(&state)?;
+            if state.active_send.is_some() || state.active_resolution.is_some() {
+                return Err(WalletClientError::SendAlreadyInProgress);
+            }
+            let generation = next_resolution_generation(&mut state)?;
+            state.active_resolution = Some((generation, Vec::new()));
+            (generation, state.config.clone())
+        };
+        let public_key = signing.verifying_key().to_bytes();
+        let changes = self.key_change_history(generation, &public_key).await?;
+        match rotated_secret(
+            &signing,
+            &half,
+            &changes,
+            config.address.as_address(),
+            config.network,
+        ) {
+            Ok(secret) => {
+                self.complete_encrypted_comment_operation(generation)?;
+                Ok(RecoveryPhrase {
+                    phrase: secret.as_str().to_owned(),
+                })
+            }
+            Err(RotatedSecretError::NotInHistory) => Err(self.fail_encrypted_comment_lookup(
+                generation,
+                "the provider's key-change history has no rotation to these words",
+            )),
+            Err(RotatedSecretError::Replaced | RotatedSecretError::OtherWallet) => {
+                self.discard_encrypted_comment_operation(generation);
+                Err(WalletClientError::WalletIdentityMismatch)
+            }
+            Err(RotatedSecretError::Derivation) => {
+                self.discard_encrypted_comment_operation(generation);
+                Err(WalletClientError::InvalidWalletPublicKey)
+            }
+        }
+    }
+}
+
 impl WalletClient {
     /// Returns this wallet's key-change history while `generation` holds the
     /// resolution slot.
@@ -318,7 +390,16 @@ impl WalletClient {
             })?;
             offset = offset.saturating_add(page.raw_count);
             let has_more = page.has_more();
-            changes.extend(page.changes);
+            let mut page_changes = page.changes;
+            for (index, message_hash) in page.pending {
+                let change = self
+                    .key_change_from_message(generation, &message_hash)
+                    .await?;
+                if let Some(slot) = page_changes.get_mut(index) {
+                    *slot = change;
+                }
+            }
+            changes.extend(page_changes);
             if !has_more {
                 break;
             }
@@ -330,6 +411,31 @@ impl WalletClient {
         }
         state.key_changes = Some(changes.clone());
         Ok(changes)
+    }
+
+    /// Reads one rotation's keys from the transaction its request message started.
+    async fn key_change_from_message(
+        &self,
+        generation: u64,
+        message_hash: &str,
+    ) -> Result<KeyChange, WalletClientError> {
+        let (request, address) = {
+            let built = self.lock().and_then(|mut state| {
+                if !state.is_current(OperationFamily::Resolution, generation) {
+                    return Err(WalletClientError::StateUnavailable);
+                }
+                let id = state.allocate_request_id()?;
+                let request = build_key_change_message_request(&state.config, id, message_hash)?;
+                Ok((request, state.config.address.clone()))
+            });
+            built.inspect_err(|_| self.discard_encrypted_comment_operation(generation))?
+        };
+        let body = self
+            .execute_encrypted_comment_request(generation, &request)
+            .await?;
+        parse_key_change_message(&body, &address).map_err(|error| {
+            self.fail_encrypted_comment_lookup(generation, error.developer_message)
+        })
     }
 }
 
@@ -1681,5 +1787,263 @@ mod tests {
         );
         assert!(http.urls().is_empty());
         assert_eq!(platform.reads(), 0, "shape errors never read the secret");
+    }
+
+    fn recovery_client(
+        public_key: &SigningKey,
+        replies: Vec<history::Reply>,
+    ) -> (
+        Arc<WalletClient>,
+        Arc<history::HistoryHost>,
+        Arc<history::PhraseHost>,
+    ) {
+        let config = WalletClientConfig {
+            public_key: public_key.verifying_key().to_bytes().to_vec(),
+            local_secret_ref: None,
+            ..client_config()
+        };
+        let http = history::HistoryHost::new(replies);
+        let platform = history::PhraseHost::new("");
+        let client =
+            WalletClient::new(config, http.clone(), platform.clone()).expect("client builds");
+        (client, http, platform)
+    }
+
+    fn half_words(phrase: &str, skip: usize) -> Vec<String> {
+        phrase
+            .split_whitespace()
+            .skip(skip)
+            .take(12)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn the_newest_words_rebuild_the_anchor_key_from_history() {
+        let keys = history::keys();
+        let wallet = client_config().address;
+        let (client, http, platform) = recovery_client(
+            &keys.current,
+            vec![history::Reply::Page(history::page(history::full_history(
+                &wallet, &keys,
+            )))],
+        );
+        let words = half_words(&keys.current_phrase, 12);
+
+        let secret = block_on(client.recover_wallet_secret(words.clone()))
+            .expect("the newest words rebuild the secret");
+
+        let (anchor, rest) = secret.phrase.split_once(' ').expect("key and words");
+        assert_eq!(anchor, hex_of(keys.anchor.as_bytes()));
+        assert_eq!(rest, words.join(" "));
+        let rebuilt = derive_wallet(&secret.phrase, Network::Testnet).expect("secret derives");
+        assert_eq!(
+            TonAddressString::from_address(&rebuilt.address, Network::Testnet),
+            wallet
+        );
+        assert_eq!(
+            rebuilt.signing_public_key(),
+            keys.current.verifying_key().to_bytes()
+        );
+        assert_eq!(http.urls().len(), 1);
+        assert_eq!(platform.reads(), 0, "no protected secret is read");
+        assert!(slot_released(&client));
+    }
+
+    #[test]
+    fn replaced_words_and_foreign_histories_are_refused() {
+        let keys = history::keys();
+        let wallet = client_config().address;
+
+        let (client, _, _) = recovery_client(
+            &keys.lost,
+            vec![history::Reply::Page(history::page(history::full_history(
+                &wallet, &keys,
+            )))],
+        );
+        let Err(error) = block_on(client.recover_wallet_secret(half_words(MNEMONIC, 12))) else {
+            panic!("a later rotation replaced these words");
+        };
+        assert_eq!(error, WalletClientError::WalletIdentityMismatch);
+        assert!(slot_released(&client));
+
+        let foreign = SigningKey::from_bytes(&[9; 32]);
+        let (client, _, _) = recovery_client(
+            &keys.current,
+            vec![history::Reply::Page(history::page(vec![
+                history::rotation(&wallet, &foreign, &keys.current),
+            ]))],
+        );
+        let Err(error) =
+            block_on(client.recover_wallet_secret(half_words(&keys.current_phrase, 12)))
+        else {
+            panic!("the history leads to another wallet");
+        };
+        assert_eq!(error, WalletClientError::WalletIdentityMismatch);
+        assert!(slot_released(&client));
+    }
+
+    #[test]
+    fn words_without_a_rotation_to_them_are_not_found() {
+        let keys = history::keys();
+        let wallet = client_config().address;
+        let (client, _, _) = recovery_client(
+            &keys.anchor,
+            vec![history::Reply::Page(history::page(history::full_history(
+                &wallet, &keys,
+            )))],
+        );
+
+        let Err(error) = block_on(client.recover_wallet_secret(half_words(MNEMONIC, 0))) else {
+            panic!("the anchor half was never installed by a rotation");
+        };
+
+        assert!(
+            matches!(
+                error,
+                WalletClientError::EncryptedCommentLookupFailed { .. }
+            ),
+            "{error:?}"
+        );
+        assert!(slot_released(&client));
+    }
+
+    #[test]
+    fn invalid_words_fail_before_any_request() {
+        let keys = history::keys();
+        let (client, http, _) = recovery_client(&keys.current, Vec::new());
+        let mut words = half_words(&keys.current_phrase, 12);
+        let _ = words.pop();
+
+        let Err(error) = block_on(client.recover_wallet_secret(words)) else {
+            panic!("eleven words");
+        };
+
+        assert_eq!(error, WalletClientError::InvalidProtectedSecret);
+        assert!(http.urls().is_empty());
+        assert!(slot_released(&client));
+    }
+
+    /// Answers like Telegram's proxied indexer: rotations without keys, and
+    /// the executed request bodies by external message hash.
+    struct KeylessHost {
+        actions: Vec<u8>,
+        bodies: Vec<(String, Vec<u8>)>,
+        requests: Mutex<Vec<HttpRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WalletHttpHost for KeylessHost {
+        async fn execute_http(&self, request: HttpRequest) -> Result<HttpResponse, HttpHostError> {
+            self.requests
+                .lock()
+                .expect("request lock")
+                .push(request.clone());
+            let body = if request.url.contains("/api/v3/actions?") {
+                self.actions.clone()
+            } else {
+                self.bodies
+                    .iter()
+                    .find(|(hash, _)| request.url.contains(hash.as_str()))
+                    .map(|(_, body)| body.clone())
+                    .expect("a scripted transaction")
+            };
+            Ok(response(request, 200, body))
+        }
+
+        async fn cancel_http(&self, _request_id: HttpRequestId) {}
+    }
+
+    fn keyless_rotation(wallet: &TonAddressString, message_hash: &str) -> serde_json::Value {
+        serde_json::json!({
+            "success": true,
+            "type": "change_wallet_key",
+            "trace_external_hash": message_hash,
+            "details": { "source": null, "destination": wallet.as_str() }
+        })
+    }
+
+    fn executed_request(wallet: &TonAddressString, old: &SigningKey, new: &SigningKey) -> Vec<u8> {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        use ton::ton_core::cell::TonCell;
+        use ton::ton_core::traits::tlb::TLB as _;
+
+        use crate::wallet::key_history::encrypt_old_private_key;
+
+        let mut proof = TonCell::builder();
+        proof.write_bits([7_u8; 64], 512).expect("proof writes");
+        let mut encrypted = TonCell::builder();
+        encrypted
+            .write_bits(encrypt_old_private_key(old, new), 256)
+            .expect("old key writes");
+        let mut request = TonCell::builder();
+        request
+            .write_bits([9_u8; 64], 512)
+            .expect("signature writes");
+        for field in [0xfbba_99c8_u32, 0x7fff_7ffd, 0x7100_0000, 1] {
+            request.write_num(&field, 32).expect("header writes");
+        }
+        request
+            .write_bits(new.verifying_key().to_bytes(), 256)
+            .expect("key writes");
+        request
+            .write_ref(proof.build().expect("proof"))
+            .expect("proof ref");
+        request
+            .write_ref(encrypted.build().expect("old key"))
+            .expect("old key ref");
+        let body = STANDARD.encode(request.build().expect("request").to_boc().expect("boc"));
+        serde_json::to_vec(&serde_json::json!({
+            "transactions": [{
+                "account": wallet.as_str(),
+                "in_msg": { "message_content": { "body": body } }
+            }]
+        }))
+        .expect("transactions JSON")
+    }
+
+    #[test]
+    fn a_history_without_keys_is_read_from_the_executed_requests() {
+        let keys = history::keys();
+        let wallet = client_config().address;
+        let http = Arc::new(KeylessHost {
+            actions: history::page(vec![
+                keyless_rotation(&wallet, "newest+hash="),
+                keyless_rotation(&wallet, "oldest+hash="),
+            ]),
+            bodies: vec![
+                (
+                    "newest%2Bhash%3D".to_owned(),
+                    executed_request(&wallet, &keys.lost, &keys.current),
+                ),
+                (
+                    "oldest%2Bhash%3D".to_owned(),
+                    executed_request(&wallet, &keys.anchor, &keys.lost),
+                ),
+            ],
+            requests: Mutex::new(Vec::new()),
+        });
+        let config = WalletClientConfig {
+            public_key: keys.current.verifying_key().to_bytes().to_vec(),
+            local_secret_ref: None,
+            ..client_config()
+        };
+        let client = WalletClient::new(config, http.clone(), history::PhraseHost::new(""))
+            .expect("client builds");
+        let words = half_words(&keys.current_phrase, 12);
+
+        let secret = block_on(client.recover_wallet_secret(words.clone()))
+            .expect("the request bodies rebuild the secret");
+
+        let (anchor, rest) = secret.phrase.split_once(' ').expect("key and words");
+        assert_eq!(anchor, hex_of(keys.anchor.as_bytes()));
+        assert_eq!(rest, words.join(" "));
+        assert_eq!(http.requests.lock().expect("request lock").len(), 3);
+        assert!(slot_released(&client));
     }
 }
