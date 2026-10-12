@@ -14,11 +14,11 @@ use zeroize::Zeroizing;
 
 use super::KeyRotationMessageKind;
 use super::crypto::{
-    SensitiveMnemonic, derive_half_key, derive_rotation_keys, derive_wallet,
-    derive_wallet_public_state,
+    SensitiveMnemonic, derive_half_key, derive_wallet, derive_wallet_public_state,
 };
 use super::key_history::encrypt_old_private_key;
-use super::mnemonic::{Bip39Half, ENTROPY_LEN, RotationMnemonic};
+use super::mnemonic::{Bip39Half, ENTROPY_LEN};
+use super::private_key::WalletSecret;
 use crate::{Boc, Network, TonAddressString};
 
 const KEY_ROTATION_PROOF_TAG: &[u8; 12] = b"KEY_ROTATION";
@@ -63,7 +63,7 @@ pub(crate) fn prepare_key_rotation(
         .as_str()
         .map_err(|_| KeyRotationError::InvalidMnemonic)?;
     let current =
-        RotationMnemonic::parse(current_phrase).map_err(|_| KeyRotationError::InvalidMnemonic)?;
+        WalletSecret::parse(current_phrase).map_err(|_| KeyRotationError::InvalidMnemonic)?;
     let wallet =
         derive_wallet(current_phrase, network).map_err(|_| KeyRotationError::InvalidMnemonic)?;
     if wallet.address != *expected_wallet.as_address() {
@@ -76,7 +76,7 @@ pub(crate) fn prepare_key_rotation(
     }
     let valid_until =
         u32::try_from(valid_until).map_err(|_| KeyRotationError::ExpirationOutOfRange)?;
-    let current_keys = derive_rotation_keys(&current);
+    let current_keys = current.keys();
 
     for _ in 0..MAX_KEY_GENERATION_ATTEMPTS {
         let mut entropy = Zeroizing::new([0_u8; ENTROPY_LEN]);
@@ -124,7 +124,7 @@ pub(crate) fn prepare_key_rotation(
     reason = "all signed header and identity fields stay explicit at the cryptographic boundary"
 )]
 fn prepare_with_new_half(
-    current: &RotationMnemonic,
+    current: &WalletSecret,
     current_key: &SigningKey,
     new_half: &Bip39Half,
     new_key: &SigningKey,
@@ -163,7 +163,11 @@ fn prepare_with_new_half(
     .map_err(|_| KeyRotationError::Preparation)?;
 
     let mut replacement_phrase = Zeroizing::new(String::new());
-    replacement_phrase.push_str(&current.anchor().to_phrase());
+    replacement_phrase.push_str(
+        &current
+            .anchor_text()
+            .map_err(|_| KeyRotationError::Preparation)?,
+    );
     replacement_phrase.push(' ');
     replacement_phrase.push_str(&new_half.to_phrase());
     let replacement_mnemonic =
@@ -269,7 +273,9 @@ mod tests {
     use ton::ton_core::traits::tlb::TLB as _;
     use ton::ton_core::types::tlb_core::MsgAddress;
 
+    use super::super::crypto::derive_rotation_keys;
     use super::super::key_history::decrypt_old_private_key;
+    use super::super::mnemonic::RotationMnemonic;
     use super::*;
 
     const CURRENT_PHRASE: &str =
@@ -626,7 +632,7 @@ mod tests {
         )
         .expect("request builds");
         let material = prepare_with_new_half(
-            &current,
+            &WalletSecret::Rotation(current),
             &current_key,
             &new_half,
             &new_key,

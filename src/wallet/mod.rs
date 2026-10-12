@@ -10,12 +10,14 @@ pub(crate) mod key_rotation;
 pub(crate) mod mnemonic;
 mod mnemonic_scheme;
 pub(crate) mod nft_transfer;
+mod private_key;
 pub(crate) mod recipient_public_key;
 pub(crate) mod send;
 pub(crate) mod slip_0010;
 pub(crate) mod transfer;
 
 pub use mnemonic_scheme::{MnemonicScheme, detect_mnemonic_schemes, rotation_mnemonic_public_key};
+pub use private_key::{detect_private_key, private_key_address, private_key_public_key};
 
 use std::sync::Arc;
 
@@ -136,6 +138,10 @@ pub struct ImportWalletRequest {
     ///
     /// [`detect_mnemonic_schemes`] classifies the same word vector without
     /// importing it, so the application can explain a rejection.
+    ///
+    /// A private-key secret is accepted as well: one Ed25519 private key,
+    /// followed after a rotation by its 12-word signing half. See
+    /// [`detect_private_key`] for the accepted key encodings.
     pub recovery_words: Vec<String>,
 }
 
@@ -247,6 +253,8 @@ pub enum WalletLifecycleError {
     /// [`detect_mnemonic_schemes`] reports whether the words form a TON or
     /// 24-word BIP-39 mnemonic instead, so the application can say why the
     /// phrase was rejected.
+    ///
+    /// A private-key secret ([`detect_private_key`]) is accepted as well.
     #[error("invalid recovery phrase")]
     InvalidRecoveryPhrase,
     /// Rust cannot construct the requested wallet address.

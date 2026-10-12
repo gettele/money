@@ -12,8 +12,8 @@ use ton::ton_core::cell::TonCell;
 use ton::ton_core::traits::tlb::TLB as _;
 use zeroize::Zeroizing;
 
-use super::crypto::{RotationKeys, derive_rotation_keys, derive_wallet_public_state};
-use super::mnemonic::RotationMnemonic;
+use super::crypto::{RotationKeys, derive_wallet_public_state};
+use super::private_key::WalletSecret;
 use crate::{Boc, Network, TonAddressString};
 
 /// TON encrypted-comment message-body opcode.
@@ -121,9 +121,9 @@ pub(crate) fn comment_keys(
 ) -> Result<RotationKeys, EncryptedCommentError> {
     let mnemonic =
         std::str::from_utf8(mnemonic_bytes).map_err(|_| EncryptedCommentError::InvalidMnemonic)?;
-    let mnemonic =
-        RotationMnemonic::parse(mnemonic).map_err(|_| EncryptedCommentError::InvalidMnemonic)?;
-    let keys = derive_rotation_keys(&mnemonic);
+    let keys = WalletSecret::parse(mnemonic)
+        .map_err(|_| EncryptedCommentError::InvalidMnemonic)?
+        .keys();
     let (address, _) = derive_wallet_public_state(&keys.anchor.verifying_key().to_bytes(), network)
         .map_err(|_| EncryptedCommentError::InvalidMnemonic)?;
     if address != *expected_wallet.as_address() {

@@ -1,0 +1,686 @@
+//! Raw Ed25519 private keys as the anchor of a Wallet rev00 account.
+//!
+//! A rotation mnemonic is one way to hold the anchor key; a private-key secret
+//! holds the 32-byte Ed25519 seed itself. Nothing on chain records how the
+//! anchor was produced, so the account address, deployment, signing, key
+//! rotation, the key-changed log, and encrypted comments behave exactly as for
+//! a rotation mnemonic with the same anchor key.
+//!
+//! A private-key secret is one token, the key, before the wallet's first key
+//! rotation. A rotation keeps the key as the anchor and appends the 12-word
+//! signing half it generated, exactly as it replaces words 13-24 of a
+//! rotation mnemonic. The engine stores the key as 64 lowercase hex digits;
+//! import also accepts 128 hex digits (seed followed by its public key), an
+//! optional `0x` prefix, and standard or URL-safe base64 of either length.
+//!
+//! A private key never matches a BIP-39 word, so the two secret forms cannot
+//! be confused, and [`detect_mnemonic_schemes`](super::detect_mnemonic_schemes)
+//! keeps reporting no scheme for a private key.
+
+use std::fmt;
+use std::fmt::Write as _;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+use ed25519_dalek::SigningKey;
+use zeroize::Zeroizing;
+
+use super::WalletLifecycleError;
+use super::crypto::{
+    RotationKeys, derive_half_key, derive_rotation_keys, derive_wallet_public_state,
+};
+use super::mnemonic::{Bip39Half, HALF_WORD_COUNT, MnemonicError, RotationMnemonic};
+use crate::types::TonAddressExt as _;
+use crate::{Network, TonAddressString};
+
+/// Bytes in an Ed25519 private key seed.
+const SEED_LEN: usize = 32;
+
+/// Bytes in a seed followed by its public key, the libsodium secret-key layout.
+const KEY_PAIR_LEN: usize = 64;
+
+/// Room for the longest canonical secret: 64 hex digits, a space, and a
+/// 12-word half of words up to eight letters, so pushing never reallocates.
+const CANONICAL_CAPACITY: usize = 192;
+
+/// A failure while reading a stored or entered wallet secret.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WalletSecretError {
+    #[error(transparent)]
+    Mnemonic(#[from] MnemonicError),
+    #[error(
+        "a private key is followed by no words or by one {HALF_WORD_COUNT}-word half, got {got}"
+    )]
+    SigningHalfWordCount { got: usize },
+}
+
+/// Every form of the secret a wallet account can be recovered from.
+pub(crate) enum WalletSecret {
+    /// A rotation mnemonic: 12 words before rotation, 24 after.
+    Rotation(RotationMnemonic),
+    /// A raw anchor key, plus the signing half once the key was rotated.
+    PrivateKey(PrivateKeySecret),
+}
+
+/// A raw Ed25519 anchor key and, after a key rotation, the signing half.
+pub(crate) struct PrivateKeySecret {
+    anchor: SigningKey,
+    signing: Option<Bip39Half>,
+}
+
+impl fmt::Debug for WalletSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rotation(mnemonic) => f.debug_tuple("Rotation").field(mnemonic).finish(),
+            Self::PrivateKey(_) => f
+                .debug_tuple("PrivateKey")
+                .field(&"***REDACTED***")
+                .finish(),
+        }
+    }
+}
+
+impl WalletSecret {
+    /// Parses a whitespace-separated secret.
+    ///
+    /// A first token that decodes as a private key selects the private-key
+    /// form; anything else must be a rotation mnemonic.
+    pub(crate) fn parse(phrase: &str) -> Result<Self, WalletSecretError> {
+        let tokens = phrase.split_whitespace().collect::<Vec<_>>();
+        if let Some((first, rest)) = tokens.split_first()
+            && let Some(seed) = decode_private_key(first)
+        {
+            let signing = match rest.len() {
+                0 => None,
+                HALF_WORD_COUNT => Some(Bip39Half::new(rest)?),
+                got => return Err(WalletSecretError::SigningHalfWordCount { got }),
+            };
+            return Ok(Self::PrivateKey(PrivateKeySecret {
+                anchor: SigningKey::from_bytes(&seed),
+                signing,
+            }));
+        }
+        Ok(Self::Rotation(RotationMnemonic::parse(phrase)?))
+    }
+
+    /// Derives the anchor and current signing keys.
+    ///
+    /// Before rotation the signing key of a private-key secret is the anchor.
+    pub(crate) fn keys(&self) -> RotationKeys {
+        match self {
+            Self::Rotation(mnemonic) => derive_rotation_keys(mnemonic),
+            Self::PrivateKey(secret) => RotationKeys {
+                anchor: secret.anchor.clone(),
+                signing: secret
+                    .signing
+                    .as_ref()
+                    .map_or_else(|| secret.anchor.clone(), derive_half_key),
+            },
+        }
+    }
+
+    /// The part of the secret that a key rotation keeps: words 1-12 of a
+    /// rotation mnemonic, or the private key in canonical hex.
+    pub(crate) fn anchor_text(&self) -> Result<Zeroizing<String>, fmt::Error> {
+        match self {
+            Self::Rotation(mnemonic) => Ok(mnemonic.anchor().to_phrase()),
+            Self::PrivateKey(secret) => {
+                let mut text = Zeroizing::new(String::with_capacity(CANONICAL_CAPACITY));
+                push_hex(&mut text, secret.anchor.as_bytes())?;
+                Ok(text)
+            }
+        }
+    }
+}
+
+/// Rewrites an entered private-key secret into the stored form.
+///
+/// Returns `None` for anything that is not a valid private-key secret, which
+/// leaves rotation mnemonics exactly as the user entered them.
+pub(crate) fn canonical_private_key_secret(phrase: &str) -> Option<Zeroizing<String>> {
+    let WalletSecret::PrivateKey(secret) = WalletSecret::parse(phrase).ok()? else {
+        return None;
+    };
+    let mut text = Zeroizing::new(String::with_capacity(CANONICAL_CAPACITY));
+    push_hex(&mut text, secret.anchor.as_bytes()).ok()?;
+    if let Some(signing) = &secret.signing {
+        text.push(' ');
+        text.push_str(&signing.to_phrase());
+    }
+    Some(text)
+}
+
+/// Reports whether the entered words are a private-key secret.
+///
+/// That is one Ed25519 private key, optionally followed by the 12-word signing
+/// half that a key rotation of its wallet generated. Pass the words exactly as
+/// an `ImportWalletRequest` would carry them; a key may also arrive as one
+/// element together with its words. Wallet import accepts every secret this
+/// function reports.
+///
+/// The key is 64 hex digits (the Ed25519 seed), 128 hex digits (the seed
+/// followed by its public key), either with an optional `0x` prefix, or
+/// standard or URL-safe base64 of 32 or 64 bytes. The function logs nothing.
+#[uniffi::export]
+#[must_use]
+pub fn detect_private_key(words: Vec<String>) -> bool {
+    let words = Zeroizing::new(words);
+    let phrase = Zeroizing::new(words.join(" "));
+    matches!(
+        WalletSecret::parse(&phrase),
+        Ok(WalletSecret::PrivateKey(_))
+    )
+}
+
+/// Returns the 32-byte anchor public key of a private-key secret.
+///
+/// The anchor key is the private key's own public key; it determines the
+/// wallet address on every network and does not change on key rotation. No
+/// storage or network is used.
+#[uniffi::export]
+pub fn private_key_public_key(phrase: String) -> Result<Vec<u8>, WalletLifecycleError> {
+    let phrase = Zeroizing::new(phrase);
+    match WalletSecret::parse(&phrase) {
+        Ok(WalletSecret::PrivateKey(secret)) => {
+            Ok(secret.anchor.verifying_key().to_bytes().to_vec())
+        }
+        Ok(WalletSecret::Rotation(_)) | Err(_) => Err(WalletLifecycleError::InvalidRecoveryPhrase),
+    }
+}
+
+/// Returns the address of the wallet a private-key secret opens on `network`.
+///
+/// The friendly non-bounceable form that `WalletDescriptor::address` holds
+/// after import, so an application can show it before importing. No storage
+/// or network is used.
+#[uniffi::export]
+pub fn private_key_address(
+    phrase: String,
+    network: Network,
+) -> Result<TonAddressString, WalletLifecycleError> {
+    let phrase = Zeroizing::new(phrase);
+    let Ok(WalletSecret::PrivateKey(secret)) = WalletSecret::parse(&phrase) else {
+        return Err(WalletLifecycleError::InvalidRecoveryPhrase);
+    };
+    let (address, _) =
+        derive_wallet_public_state(&secret.anchor.verifying_key().to_bytes(), network)
+            .map_err(|_| WalletLifecycleError::AddressDerivationFailed)?;
+    TonAddressString::try_from(address.to_user_friendly(network))
+        .map_err(|_| WalletLifecycleError::AddressDerivationFailed)
+}
+
+/// Decodes one private-key token into its Ed25519 seed.
+fn decode_private_key(token: &str) -> Option<Zeroizing<[u8; SEED_LEN]>> {
+    let bytes = decode_hex(token).or_else(|| decode_base64(token))?;
+    match bytes.len() {
+        SEED_LEN => seed_from(&bytes),
+        KEY_PAIR_LEN => {
+            let (seed, public_key) = bytes.split_at_checked(SEED_LEN)?;
+            let seed = seed_from(seed)?;
+            let derived = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+            (derived.as_slice() == public_key).then_some(seed)
+        }
+        _ => None,
+    }
+}
+
+fn seed_from(bytes: &[u8]) -> Option<Zeroizing<[u8; SEED_LEN]>> {
+    let mut seed = Zeroizing::new([0_u8; SEED_LEN]);
+    seed.as_mut_slice().copy_from_slice(
+        bytes
+            .get(..SEED_LEN)
+            .filter(|head| head.len() == bytes.len())?,
+    );
+    Some(seed)
+}
+
+fn decode_hex(token: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let digits = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+        .unwrap_or(token);
+    if !matches!(digits.len(), 64 | 128) || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(KEY_PAIR_LEN));
+    for pair in digits.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(pair).ok()?;
+        bytes.push(u8::from_str_radix(pair, 16).ok()?);
+    }
+    Some(bytes)
+}
+
+/// Room for the decode estimate of the longest accepted base64 token, 88 characters.
+const BASE64_BUFFER_LEN: usize = 96;
+
+/// Decodes base64 in place, so failed attempts never leave key bytes on the heap.
+fn decode_base64(token: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let mut buffer = Zeroizing::new([0_u8; BASE64_BUFFER_LEN]);
+    let len = [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
+        .iter()
+        .find_map(|engine| engine.decode_slice(token, buffer.as_mut_slice()).ok())?;
+    buffer
+        .get(..len)
+        .map(|bytes| Zeroizing::new(bytes.to_vec()))
+}
+
+fn push_hex(text: &mut String, bytes: &[u8]) -> fmt::Result {
+    for byte in bytes {
+        write!(text, "{byte:02x}")?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use futures::executor::block_on;
+
+    use super::*;
+    use crate::domain::{
+        Network, ProtectedSecretHostError, ProtectedSecretRead, ProtectedSecretRef,
+        ProtectedSecretStore,
+    };
+    use crate::engine::WalletPlatformHost;
+    use crate::wallet::crypto::{SensitiveMnemonic, derive_wallet};
+    use crate::wallet::encrypted_comment::comment_keys;
+    use crate::wallet::key_history::decrypt_old_private_key;
+    use crate::wallet::key_rotation::prepare_key_rotation;
+    use crate::wallet::{
+        ImportWalletRequest, KeyRotationMessageKind, WalletLifecycle, detect_mnemonic_schemes,
+        rotation_mnemonic_public_key,
+    };
+    use crate::{
+        JournalCompareExchange, JournalCompareExchangeResult, JournalHostError, JournalKey,
+        JournalRecord, TonAddressString,
+    };
+
+    /// The anchor seed of the official BIP-39 half [`HALF`] on `m/44'/607'/0'`,
+    /// pinned in `crypto::tests::rotation_keys_match_the_reference_derivation`.
+    const SEED: &str = "b477ef5ed17fb8a2b8faddd7a9835a227243a82c70b190c7af4896155aa7df9f";
+
+    /// The public key of [`SEED`].
+    const PUBLIC_KEY: &str = "7952e94118f34607c75e23258dd9220d66ccac5a3ee074125c25068e8107bfbf";
+
+    const HALF: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    const SIGNING_HALF: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+
+    /// The mainnet address of [`SEED`], computed independently by a raw-key
+    /// vanity generator for the Telegram wallet contract.
+    const MAINNET_ADDRESS: &str = "UQD4d2pzr-W4jzh1wOd52HrsH7rRagzkSUPC3_jCgMxmKz_L";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn unhex(text: &str) -> Vec<u8> {
+        decode_hex(text).expect("fixture is hex").to_vec()
+    }
+
+    fn rotated() -> String {
+        format!("{SEED} {SIGNING_HALF}")
+    }
+
+    /// Stores one secret in memory and serves it back.
+    #[derive(Default)]
+    struct MemoryHost {
+        secret: Mutex<Option<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WalletPlatformHost for MemoryHost {
+        async fn read_protected_secret(
+            &self,
+            _request: ProtectedSecretRead,
+        ) -> Result<Vec<u8>, ProtectedSecretHostError> {
+            Ok(self
+                .secret
+                .lock()
+                .expect("secret lock")
+                .clone()
+                .expect("a secret was stored"))
+        }
+
+        async fn store_protected_secret(
+            &self,
+            request: ProtectedSecretStore,
+        ) -> Result<(), ProtectedSecretHostError> {
+            *self.secret.lock().expect("secret lock") = Some(request.bytes);
+            Ok(())
+        }
+
+        async fn delete_protected_secret(
+            &self,
+            _secret_ref: ProtectedSecretRef,
+        ) -> Result<(), ProtectedSecretHostError> {
+            panic!("not used by private-key import")
+        }
+
+        async fn load_journal(
+            &self,
+            _key: JournalKey,
+        ) -> Result<Option<JournalRecord>, JournalHostError> {
+            panic!("not used by private-key import")
+        }
+
+        async fn compare_exchange_journal(
+            &self,
+            _mutation: JournalCompareExchange,
+        ) -> Result<JournalCompareExchangeResult, JournalHostError> {
+            panic!("not used by private-key import")
+        }
+    }
+
+    #[test]
+    fn a_private_key_derives_the_wallet_of_its_phrase() {
+        for network in [Network::Mainnet, Network::Testnet] {
+            let from_key = derive_wallet(SEED, network).expect("key derives");
+            let from_phrase = derive_wallet(HALF, network).expect("phrase derives");
+
+            assert_eq!(from_key.address, from_phrase.address);
+            assert_eq!(hex(&from_key.key_pair.public_key), PUBLIC_KEY);
+            assert_eq!(hex(&from_key.signing_public_key()), PUBLIC_KEY);
+            assert!(from_key.is_pre_rotation());
+        }
+        let mainnet = derive_wallet(SEED, Network::Mainnet).expect("key derives");
+        assert_eq!(
+            mainnet.address.to_user_friendly(Network::Mainnet),
+            MAINNET_ADDRESS
+        );
+    }
+
+    #[test]
+    fn a_rotated_private_key_matches_the_rotated_phrase() {
+        let phrase = format!("{HALF} {SIGNING_HALF}");
+        let from_key = derive_wallet(&rotated(), Network::Testnet).expect("key derives");
+        let from_phrase = derive_wallet(&phrase, Network::Testnet).expect("phrase derives");
+
+        assert_eq!(from_key.address, from_phrase.address);
+        assert_eq!(
+            from_key.key_pair.public_key,
+            from_phrase.key_pair.public_key
+        );
+        assert_eq!(
+            from_key.signing_public_key(),
+            from_phrase.signing_public_key()
+        );
+        assert!(!from_key.is_pre_rotation());
+    }
+
+    #[test]
+    fn every_key_encoding_reads_the_same_seed() {
+        let seed = unhex(SEED);
+        let pair = [seed.clone(), unhex(PUBLIC_KEY)].concat();
+        let encodings = [
+            SEED.to_owned(),
+            SEED.to_uppercase(),
+            format!("0x{SEED}"),
+            format!("0X{}", SEED.to_uppercase()),
+            format!("{SEED}{PUBLIC_KEY}"),
+            format!("0x{SEED}{PUBLIC_KEY}"),
+            STANDARD.encode(&seed),
+            STANDARD_NO_PAD.encode(&seed),
+            URL_SAFE.encode(&pair),
+            URL_SAFE_NO_PAD.encode(&pair),
+            STANDARD.encode(&pair),
+            "tHfvXtF/uKK4+t3XqYNaInJDqCxwsZDHr0iWFVqn358=".to_owned(),
+            "tHfvXtF_uKK4-t3XqYNaInJDqCxwsZDHr0iWFVqn358".to_owned(),
+        ];
+        for encoding in encodings {
+            assert_eq!(
+                canonical_private_key_secret(&encoding)
+                    .as_deref()
+                    .map(String::as_str),
+                Some(SEED),
+                "{encoding}"
+            );
+            assert_eq!(
+                canonical_private_key_secret(&format!(" {encoding}\n{SIGNING_HALF} "))
+                    .as_deref()
+                    .map(String::as_str),
+                Some(rotated().as_str()),
+                "{encoding}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_secrets_are_rejected() {
+        let short = SEED.get(..62).expect("fixture is ASCII");
+        let rejected = [
+            String::new(),
+            short.to_owned(),
+            format!("{SEED}0"),
+            format!("{short}zz"),
+            format!("0x{short}"),
+            format!("{SEED}{}", "00".repeat(32)),
+            STANDARD.encode([7_u8; 31]),
+            STANDARD.encode([7_u8; 48]),
+            STANDARD.encode([unhex(SEED), vec![0; 32]].concat()),
+            format!("0x{}", STANDARD.encode(unhex(SEED))),
+            "tHfvXtF/uKK4+t3XqYNaInJDqCxwsZDHr0iWFVqn359=".to_owned(),
+            format!("{SEED} zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong"),
+            format!("{SEED} {SIGNING_HALF} zoo"),
+            format!("{SEED} {SIGNING_HALF} {SIGNING_HALF}"),
+            format!("{SEED} zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo"),
+            format!("{SIGNING_HALF} {SEED}"),
+            format!("{SEED} {SEED}"),
+        ];
+        for secret in rejected {
+            assert!(WalletSecret::parse(&secret).is_err(), "{secret}");
+            assert!(!detect_private_key(vec![secret.clone()]), "{secret}");
+            assert!(canonical_private_key_secret(&secret).is_none(), "{secret}");
+            assert!(
+                derive_wallet(&secret, Network::Mainnet).is_err(),
+                "{secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn detection_tells_private_keys_from_phrases() {
+        let words = |text: &str| {
+            text.split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(detect_private_key(words(SEED)));
+        assert!(detect_private_key(words(&rotated())));
+        assert!(detect_private_key(vec![rotated()]));
+        assert!(!detect_private_key(words(HALF)));
+        assert!(!detect_private_key(words(&format!(
+            "{HALF} {SIGNING_HALF}"
+        ))));
+        assert!(detect_mnemonic_schemes(words(SEED)).is_empty());
+        assert!(detect_mnemonic_schemes(words(&rotated())).is_empty());
+    }
+
+    #[test]
+    fn the_public_key_is_the_anchor_key() {
+        for secret in [SEED.to_owned(), rotated(), format!("0x{SEED}{PUBLIC_KEY}")] {
+            assert_eq!(
+                private_key_public_key(secret).map(|key| hex(&key)),
+                Ok(PUBLIC_KEY.to_owned())
+            );
+        }
+        for secret in [HALF.to_owned(), String::new(), format!("{SEED} zoo")] {
+            assert_eq!(
+                private_key_public_key(secret),
+                Err(WalletLifecycleError::InvalidRecoveryPhrase)
+            );
+        }
+        assert_eq!(
+            rotation_mnemonic_public_key(SEED.to_owned()),
+            Err(WalletLifecycleError::InvalidRecoveryPhrase)
+        );
+    }
+
+    #[test]
+    fn the_address_is_the_imported_wallet_address() {
+        for secret in [SEED.to_owned(), rotated(), format!("0x{SEED}{PUBLIC_KEY}")] {
+            assert_eq!(
+                private_key_address(secret.clone(), Network::Mainnet)
+                    .as_ref()
+                    .map(TonAddressString::as_str),
+                Ok(MAINNET_ADDRESS)
+            );
+            let testnet = derive_wallet(&secret, Network::Testnet).expect("key derives");
+            assert_eq!(
+                private_key_address(secret, Network::Testnet),
+                Ok(TonAddressString::from_address(
+                    &testnet.address,
+                    Network::Testnet
+                ))
+            );
+        }
+        for secret in [HALF.to_owned(), String::new(), format!("{SEED} zoo")] {
+            assert_eq!(
+                private_key_address(secret, Network::Mainnet),
+                Err(WalletLifecycleError::InvalidRecoveryPhrase)
+            );
+        }
+    }
+
+    #[test]
+    fn import_stores_the_canonical_key_and_reveal_returns_it() {
+        let cases = [
+            (vec![format!("0X{}", SEED.to_uppercase())], SEED.to_owned()),
+            (
+                std::iter::once(STANDARD.encode(unhex(SEED)))
+                    .chain(SIGNING_HALF.to_uppercase().split(' ').map(str::to_owned))
+                    .collect(),
+                rotated(),
+            ),
+        ];
+        for (recovery_words, stored) in cases {
+            let host = Arc::new(MemoryHost::default());
+            let lifecycle = WalletLifecycle::new(host.clone());
+            let descriptor = block_on(lifecycle.import_wallet(ImportWalletRequest {
+                record_id: "private-key-import".to_owned(),
+                network: Network::Mainnet,
+                recovery_words,
+            }))
+            .expect("private key imports");
+
+            assert_eq!(descriptor.address.as_str(), MAINNET_ADDRESS);
+            assert_eq!(hex(&descriptor.public_key), PUBLIC_KEY);
+            assert_eq!(
+                host.secret.lock().expect("secret lock").as_deref(),
+                Some(stored.as_bytes())
+            );
+            let revealed =
+                block_on(lifecycle.reveal_recovery_phrase(descriptor)).expect("secret reveals");
+            assert_eq!(revealed.phrase, stored);
+        }
+    }
+
+    #[test]
+    fn rotation_keeps_the_private_key_as_the_anchor() {
+        let wallet = derive_wallet(SEED, Network::Testnet).expect("key derives");
+        let address = TonAddressString::from_address(&wallet.address, Network::Testnet);
+        let mut current =
+            SensitiveMnemonic::from_bytes(SEED.as_bytes().to_vec()).expect("key is a secret");
+        let mut current_signing = SigningKey::from_bytes(
+            &<[u8; 32]>::try_from(unhex(SEED).as_slice()).expect("seed length"),
+        );
+
+        for needs_state_init in [true, false] {
+            let material = prepare_key_rotation(
+                &current,
+                Network::Testnet,
+                &address,
+                7,
+                needs_state_init,
+                u64::from(u32::MAX),
+                KeyRotationMessageKind::External,
+            )
+            .expect("rotation prepares");
+            let replacement = material
+                .replacement_mnemonic
+                .as_str()
+                .expect("replacement is UTF-8")
+                .to_owned();
+
+            let (anchor, half) = replacement.split_once(' ').expect("key and half");
+            assert_eq!(anchor, SEED);
+            assert_eq!(half.split(' ').count(), HALF_WORD_COUNT);
+            let keys = WalletSecret::parse(&replacement)
+                .expect("replacement parses")
+                .keys();
+            assert_eq!(hex(&keys.anchor.verifying_key().to_bytes()), PUBLIC_KEY);
+            assert_eq!(
+                keys.signing.verifying_key().to_bytes(),
+                material.new_public_key
+            );
+            assert_ne!(keys.signing.as_bytes(), current_signing.as_bytes());
+
+            let rotated_wallet =
+                derive_wallet(&replacement, Network::Testnet).expect("replacement derives");
+            assert_eq!(rotated_wallet.address, wallet.address);
+
+            let encrypted = encrypted_old_key(&material.signed_boc);
+            assert_eq!(
+                decrypt_old_private_key(&encrypted, &keys.signing).as_bytes(),
+                current_signing.as_bytes()
+            );
+
+            current_signing = keys.signing;
+            current = SensitiveMnemonic::from_bytes(replacement.into_bytes())
+                .expect("replacement is a secret");
+            if needs_state_init {
+                assert!(
+                    prepare_key_rotation(
+                        &current,
+                        Network::Testnet,
+                        &address,
+                        8,
+                        true,
+                        u64::from(u32::MAX),
+                        KeyRotationMessageKind::External,
+                    )
+                    .is_err(),
+                    "a rotated key cannot deploy"
+                );
+            }
+        }
+    }
+
+    /// Reads the encrypted old private key: the second ref of the signed request.
+    fn encrypted_old_key(boc: &crate::Boc) -> [u8; 32] {
+        use ton::block_tlb::Msg;
+        use ton::ton_core::cell::TonCell;
+        use ton::ton_core::traits::tlb::TLB as _;
+
+        let message =
+            Msg::<TonCell>::from_boc(boc.as_bytes().to_vec()).expect("rotation BOC decodes");
+        let encrypted = message
+            .body
+            .value
+            .refs()
+            .get(1)
+            .expect("encrypted old private key ref")
+            .parser()
+            .read_bits(256)
+            .expect("encrypted old private key");
+        <[u8; 32]>::try_from(encrypted.as_slice()).expect("32 bytes")
+    }
+
+    #[test]
+    fn comment_keys_accept_private_keys() {
+        let wallet = derive_wallet(SEED, Network::Testnet).expect("key derives");
+        let address = TonAddressString::from_address(&wallet.address, Network::Testnet);
+
+        let keys = comment_keys(rotated().as_bytes(), Network::Testnet, &address)
+            .expect("comment keys derive");
+        assert_eq!(hex(keys.anchor.as_bytes()), SEED);
+        assert_eq!(
+            keys.signing.verifying_key().to_bytes(),
+            derive_wallet(&rotated(), Network::Testnet)
+                .expect("rotated key derives")
+                .signing_public_key()
+        );
+    }
+}

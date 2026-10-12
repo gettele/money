@@ -27,6 +27,7 @@ use ton::ton_wallet::{
 use zeroize::Zeroizing;
 
 use super::mnemonic::{Bip39Half, ENTROPY_LEN, RotationMnemonic};
+use super::private_key::{WalletSecret, canonical_private_key_secret};
 use super::slip_0010::{TON_ACCOUNT_PATH, derive_path, hmac_sha512, signing_key};
 use crate::Network;
 
@@ -162,7 +163,14 @@ impl SensitiveMnemonic {
             bytes.extend_from_slice(word.as_bytes());
         }
 
-        Self::from_bytes(bytes)
+        let mut entered = Zeroizing::new(bytes);
+        if let Some(canonical) = std::str::from_utf8(&entered)
+            .ok()
+            .and_then(canonical_private_key_secret)
+        {
+            return Self::from_bytes(canonical.as_bytes().to_vec());
+        }
+        Self::from_bytes(std::mem::take(&mut *entered))
     }
 
     pub(crate) fn from_bytes(bytes: Vec<u8>) -> Result<Self, WalletCryptoError> {
@@ -182,10 +190,11 @@ impl SensitiveMnemonic {
         std::str::from_utf8(&self.bytes).map_err(|_| WalletCryptoError::InvalidMnemonic)
     }
 
-    /// Parses the buffer as a rotation mnemonic: two checksummed BIP-39 halves.
+    /// Parses the buffer as a wallet secret: a rotation mnemonic of two
+    /// checksummed BIP-39 halves, or a private key.
     fn validate(&self) -> Result<(), WalletCryptoError> {
         let phrase = self.as_str()?;
-        RotationMnemonic::parse(phrase)
+        WalletSecret::parse(phrase)
             .map(|_| ())
             .map_err(|_| WalletCryptoError::InvalidMnemonic)
     }
@@ -276,9 +285,9 @@ pub(crate) fn derive_wallet(
     mnemonic: &str,
     network: Network,
 ) -> Result<SensitiveWallet, WalletCryptoError> {
-    let mnemonic =
-        RotationMnemonic::parse(mnemonic).map_err(|_| WalletCryptoError::InvalidMnemonic)?;
-    let keys = derive_rotation_keys(&mnemonic);
+    let keys = WalletSecret::parse(mnemonic)
+        .map_err(|_| WalletCryptoError::InvalidMnemonic)?
+        .keys();
 
     let contract_wallet_id = wallet_contract_id(network);
 
