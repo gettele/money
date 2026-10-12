@@ -59,7 +59,7 @@ A tag is reproducible: `ci/apply.sh <wallet-engine clone> <commit>` builds the s
 
 ## Staying current
 
-[`sync.yml`](.github/workflows/sync.yml) runs every 3 hours. It reads the engine commit pinned by Telegram Desktop (latest release and `dev`) and Telegram iOS (`master` and the latest `release-*` tag), applies the patches to each one that has no tag yet, runs the engine's tests, and pushes the tag. It also checks that desktop-app's `wallet-engine.patch` applies on top. A failure opens an issue instead; the next passing run closes it. Run it by hand with an extra `pin` for any other commit.
+[`sync.yml`](.github/workflows/sync.yml) runs every hour. It reads the engine commit pinned by Telegram Desktop (latest release and `dev`) and Telegram iOS (`master` and the latest `release-*` tag), applies the patches to each one that has no tag yet, runs the engine's tests, and pushes the tag. It also checks that desktop-app's `wallet-engine.patch` applies on top. A failure opens an issue instead; the next passing run closes it. Run it by hand with an extra `pin` for any other commit.
 
 When the patches don't apply, fix them locally:
 
