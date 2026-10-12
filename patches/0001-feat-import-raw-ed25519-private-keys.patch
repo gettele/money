@@ -8,8 +8,8 @@ Subject: [PATCH] feat: import raw ed25519 private keys
  src/wallet/encrypted_comment.rs |  10 +-
  src/wallet/key_rotation.rs      |  22 +-
  src/wallet/mod.rs               |   8 +
- src/wallet/private_key.rs       | 636 ++++++++++++++++++++++++++++++++
- 5 files changed, 678 insertions(+), 19 deletions(-)
+ src/wallet/private_key.rs       | 686 ++++++++++++++++++++++++++++++++
+ 5 files changed, 728 insertions(+), 19 deletions(-)
  create mode 100644 src/wallet/private_key.rs
 
 diff --git a/src/wallet/crypto.rs b/src/wallet/crypto.rs
@@ -174,7 +174,7 @@ index cbc3e6a64e2964346ca9bdf8cb65a40e58ba6f8e..8cf5d25e632e610a2719f73481ae3a2a
              &new_half,
              &new_key,
 diff --git a/src/wallet/mod.rs b/src/wallet/mod.rs
-index 8843ccba2c5f96f974f91eb0cca81e766c4d2e42..453d0eb0710db09c638d3b3265c9f063b42ce726 100644
+index 8843ccba2c5f96f974f91eb0cca81e766c4d2e42..81d49909d4ae595a527907a4c9ca0ad99de03139 100644
 --- a/src/wallet/mod.rs
 +++ b/src/wallet/mod.rs
 @@ -10,12 +10,14 @@ pub(crate) mod key_rotation;
@@ -188,7 +188,7 @@ index 8843ccba2c5f96f974f91eb0cca81e766c4d2e42..453d0eb0710db09c638d3b3265c9f063
  pub(crate) mod transfer;
  
  pub use mnemonic_scheme::{MnemonicScheme, detect_mnemonic_schemes, rotation_mnemonic_public_key};
-+pub use private_key::{detect_private_key, private_key_public_key};
++pub use private_key::{detect_private_key, private_key_address, private_key_public_key};
  
  use std::sync::Arc;
  
@@ -214,10 +214,10 @@ index 8843ccba2c5f96f974f91eb0cca81e766c4d2e42..453d0eb0710db09c638d3b3265c9f063
      /// Rust cannot construct the requested wallet address.
 diff --git a/src/wallet/private_key.rs b/src/wallet/private_key.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..f13fcd7fa42d5565acb18308fdb00a636215fd44
+index 0000000000000000000000000000000000000000..2be3918db638d2a1a2c0649007ccbdf0b05d9fb0
 --- /dev/null
 +++ b/src/wallet/private_key.rs
-@@ -0,0 +1,636 @@
+@@ -0,0 +1,686 @@
 +//! Raw Ed25519 private keys as the anchor of a Wallet rev00 account.
 +//!
 +//! A rotation mnemonic is one way to hold the anchor key; a private-key secret
@@ -246,8 +246,12 @@ index 0000000000000000000000000000000000000000..f13fcd7fa42d5565acb18308fdb00a63
 +use zeroize::Zeroizing;
 +
 +use super::WalletLifecycleError;
-+use super::crypto::{RotationKeys, derive_half_key, derive_rotation_keys};
++use super::crypto::{
++    RotationKeys, derive_half_key, derive_rotation_keys, derive_wallet_public_state,
++};
 +use super::mnemonic::{Bip39Half, HALF_WORD_COUNT, MnemonicError, RotationMnemonic};
++use crate::types::TonAddressExt as _;
++use crate::{Network, TonAddressString};
 +
 +/// Bytes in an Ed25519 private key seed.
 +const SEED_LEN: usize = 32;
@@ -404,6 +408,27 @@ index 0000000000000000000000000000000000000000..f13fcd7fa42d5565acb18308fdb00a63
 +    }
 +}
 +
++/// Returns the address of the wallet a private-key secret opens on `network`.
++///
++/// The friendly non-bounceable form that `WalletDescriptor::address` holds
++/// after import, so an application can show it before importing. No storage
++/// or network is used.
++#[uniffi::export]
++pub fn private_key_address(
++    phrase: String,
++    network: Network,
++) -> Result<TonAddressString, WalletLifecycleError> {
++    let phrase = Zeroizing::new(phrase);
++    let Ok(WalletSecret::PrivateKey(secret)) = WalletSecret::parse(&phrase) else {
++        return Err(WalletLifecycleError::InvalidRecoveryPhrase);
++    };
++    let (address, _) =
++        derive_wallet_public_state(&secret.anchor.verifying_key().to_bytes(), network)
++            .map_err(|_| WalletLifecycleError::AddressDerivationFailed)?;
++    TonAddressString::try_from(address.to_user_friendly(network))
++        .map_err(|_| WalletLifecycleError::AddressDerivationFailed)
++}
++
 +/// Decodes one private-key token into its Ed25519 seed.
 +fn decode_private_key(token: &str) -> Option<Zeroizing<[u8; SEED_LEN]>> {
 +    let bytes = decode_hex(token).or_else(|| decode_base64(token))?;
@@ -478,7 +503,6 @@ index 0000000000000000000000000000000000000000..f13fcd7fa42d5565acb18308fdb00a63
 +        ProtectedSecretStore,
 +    };
 +    use crate::engine::WalletPlatformHost;
-+    use crate::types::TonAddressExt as _;
 +    use crate::wallet::crypto::{SensitiveMnemonic, derive_wallet};
 +    use crate::wallet::encrypted_comment::comment_keys;
 +    use crate::wallet::key_history::decrypt_old_private_key;
@@ -712,6 +736,32 @@ index 0000000000000000000000000000000000000000..f13fcd7fa42d5565acb18308fdb00a63
 +            rotation_mnemonic_public_key(SEED.to_owned()),
 +            Err(WalletLifecycleError::InvalidRecoveryPhrase)
 +        );
++    }
++
++    #[test]
++    fn the_address_is_the_imported_wallet_address() {
++        for secret in [SEED.to_owned(), rotated(), format!("0x{SEED}{PUBLIC_KEY}")] {
++            assert_eq!(
++                private_key_address(secret.clone(), Network::Mainnet)
++                    .as_ref()
++                    .map(TonAddressString::as_str),
++                Ok(MAINNET_ADDRESS)
++            );
++            let testnet = derive_wallet(&secret, Network::Testnet).expect("key derives");
++            assert_eq!(
++                private_key_address(secret, Network::Testnet),
++                Ok(TonAddressString::from_address(
++                    &testnet.address,
++                    Network::Testnet
++                ))
++            );
++        }
++        for secret in [HALF.to_owned(), String::new(), format!("{SEED} zoo")] {
++            assert_eq!(
++                private_key_address(secret, Network::Mainnet),
++                Err(WalletLifecycleError::InvalidRecoveryPhrase)
++            );
++        }
 +    }
 +
 +    #[test]

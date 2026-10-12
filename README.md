@@ -28,6 +28,7 @@ API, all additive:
 | `importWallet` / `import_wallet` | `recoveryWords` may hold a private-key secret: the key alone, or the key followed by the 12 words, as one element or several |
 | `revealRecoveryPhrase` | returns the stored form: the hex key, plus the 12 words after a rotation |
 | `detectPrivateKey(words)` / `detect_private_key` | `true` for a private-key secret; `detectMnemonicSchemes` still reports nothing for it |
+| `privateKeyAddress(phrase, network)` / `private_key_address` | the address the key opens, before importing |
 | `privateKeyPublicKey(phrase)` / `private_key_public_key` | the anchor public key, like `rotationMnemonicPublicKey` |
 
 Rotation mnemonics behave exactly as upstream: same stored bytes, same keys, same reveal output. No dependency is added.
