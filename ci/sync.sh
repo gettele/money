@@ -82,6 +82,8 @@ for pin in $(cut -d' ' -f1 "$root/pins.txt" | sort -u); do
         echo "would tag $tag at $(git -C "$engine" rev-parse HEAD)"
     else
         git -C "$engine" tag "$tag"
+        git -C "$engine" lfs fetch --all origin
+        git -C "$engine" lfs push "$PUSH_REMOTE" "refs/tags/$tag"
         git -C "$engine" push -q "$PUSH_REMOTE" "refs/tags/$tag"
         echo "tagged $tag at $(git -C "$engine" rev-parse HEAD)"
     fi
