@@ -137,18 +137,62 @@ pub(super) fn parse_key_change_page(
     Ok(KeyChangePage { changes, raw_count })
 }
 
+/// Reads a 32-byte key of a `change_wallet_key` action.
+///
+/// Toncenter reports keys as 64 hex digits, while other indexer deployments,
+/// such as Telegram's proxied one, use standard or URL-safe base64 or a decimal
+/// integer. The values are public, so a rejected one is quoted in the error.
 fn parse_key_hex(value: Option<String>, field: &str) -> Result<[u8; 32], DomainError> {
-    let malformed = || invalid_response(format!("change_wallet_key {field} is not 32 hex bytes"));
-    let value = value.ok_or_else(malformed)?;
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(malformed());
+    let malformed = |value: &str| {
+        let shown = value.chars().take(100).collect::<String>();
+        invalid_response(format!(
+            "change_wallet_key {field} is not a 32-byte key: {shown:?}"
+        ))
+    };
+    let value = value.ok_or_else(|| malformed(""))?;
+    let trimmed = value.trim();
+    key_from_hex(trimmed)
+        .or_else(|| key_from_base64(trimmed))
+        .or_else(|| key_from_decimal(trimmed))
+        .ok_or_else(|| malformed(&value))
+}
+
+fn key_from_hex(value: &str) -> Option<[u8; 32]> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if digits.len() != 64 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
     }
     let mut bytes = [0_u8; 32];
-    for (byte, pair) in bytes.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
-        let pair = std::str::from_utf8(pair).map_err(|_| malformed())?;
-        *byte = u8::from_str_radix(pair, 16).map_err(|_| malformed())?;
+    for (byte, pair) in bytes.iter_mut().zip(digits.as_bytes().chunks_exact(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
     }
-    Ok(bytes)
+    Some(bytes)
+}
+
+fn key_from_base64(value: &str) -> Option<[u8; 32]> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+
+    let mut bytes = [0_u8; 48];
+    let len = [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
+        .iter()
+        .find_map(|engine| engine.decode_slice(value, &mut bytes).ok())?;
+    <[u8; 32]>::try_from(bytes.get(..len)?).ok()
+}
+
+fn key_from_decimal(value: &str) -> Option<[u8; 32]> {
+    if !(70..=78).contains(&value.len()) || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let number = num_bigint::BigUint::parse_bytes(value.as_bytes(), 10)?;
+    let digits = number.to_bytes_be();
+    let mut bytes = [0_u8; 32];
+    let start = bytes.len().checked_sub(digits.len())?;
+    bytes.get_mut(start..)?.copy_from_slice(&digits);
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -324,6 +368,57 @@ mod tests {
                 String::from_utf8_lossy(&body)
             );
         }
+    }
+
+    #[test]
+    fn keys_arrive_as_hex_base64_or_decimal() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+
+        let key = bytes(NEW_KEY);
+        let encrypted = bytes(ENCRYPTED);
+        let decimal = |value: &[u8; 32]| num_bigint::BigUint::from_bytes_be(value).to_str_radix(10);
+        let encodings = [
+            (
+                json!(format!("0x{NEW_KEY}")),
+                json!(ENCRYPTED.to_uppercase()),
+            ),
+            (
+                json!(STANDARD.encode(key)),
+                json!(URL_SAFE_NO_PAD.encode(encrypted)),
+            ),
+            (json!(decimal(&key)), json!(decimal(&encrypted))),
+        ];
+        for (new_public_key, encrypted_old_private_key) in encodings {
+            let page = parse_key_change_page(
+                &page(vec![rotation(
+                    WALLET,
+                    new_public_key.clone(),
+                    encrypted_old_private_key,
+                )]),
+                &wallet(),
+            )
+            .expect("the page parses");
+            assert_eq!(
+                page.changes,
+                vec![KeyChange {
+                    new_public_key: key,
+                    encrypted_old_private_key: encrypted,
+                }],
+                "{new_public_key}"
+            );
+        }
+
+        let error = parse_key_change_page(
+            &page(vec![rotation(WALLET, json!("12345"), json!(ENCRYPTED))]),
+            &wallet(),
+        )
+        .expect_err("a short number is no key");
+        assert!(
+            error.developer_message.contains("\"12345\""),
+            "{}",
+            error.developer_message
+        );
     }
 
     #[test]
