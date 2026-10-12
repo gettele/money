@@ -1,0 +1,52 @@
+name: Sync
+
+on:
+  schedule:
+    - cron: "41 */3 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - patches/**
+      - SERIES
+      - ci/**
+      - .github/workflows/sync.yml
+  workflow_dispatch:
+    inputs:
+      pin:
+        description: Extra wallet-engine commit to tag (full hash)
+        required: false
+        type: string
+      dry_run:
+        description: Build and test without tagging or opening issues
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXTRA_PIN: ${{ inputs.pin }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          key=$(mktemp)
+          printf '%s\n' "$DEPLOY_KEY" > "$key"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          export PUSH_REMOTE="git@github.com:$GITHUB_REPOSITORY.git"
+          bash ci/sync.sh
