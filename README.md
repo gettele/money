@@ -30,6 +30,9 @@ API, all additive:
 | `detectPrivateKey(words)` / `detect_private_key` | `true` for a private-key secret; `detectMnemonicSchemes` still reports nothing for it |
 | `privateKeyAddress(phrase, network)` / `private_key_address` | the address the key opens, before importing |
 | `privateKeyPublicKey(phrase)` / `private_key_public_key` | the anchor public key, like `rotationMnemonicPublicKey` |
+| `WalletClient.recoverWalletSecret(words)` / `recover_wallet_secret` | rebuilds a rotated wallet's secret from its address and the 12 words of its latest rotation (see below) |
+
+After a key rotation, the address and the 12 new words are enough. Every rotation publishes the key it replaced, encrypted with the key it installs, and before the first rotation the signing key is the anchor key. `recoverWalletSecret` runs on a public-key-only client configured with the wallet's address and the key of the words (`rotationMnemonicPublicKey`): it reads the wallet's `change_wallet_key` history from Toncenter v3, walks it back to the anchor key, checks that the anchor opens the address, and returns `<private key> <12 words>` for `importWallet`. It refuses words that a later rotation replaced. This works for any rotated Telegram wallet, including ones created from a 24-word phrase: the address and words 13-24 restore it, the first 12 words are no longer needed.
 
 Rotation mnemonics behave exactly as upstream: same stored bytes, same keys, same reveal output. No dependency is added.
 
