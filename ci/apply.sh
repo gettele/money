@@ -12,5 +12,5 @@ pin=$2
 git -C "$engine" checkout -q --detach "$pin"
 GIT_COMMITTER_NAME=nitreojs \
 GIT_COMMITTER_EMAIL=hello@starkow.dev \
-    git -C "$engine" am -q --3way --keep-cr --committer-date-is-author-date \
+    git -C "$engine" -c commit.gpgSign=false am -q --3way --keep-cr --committer-date-is-author-date \
     "$root"/patches/*.patch
