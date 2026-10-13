@@ -4,18 +4,18 @@ Date: Mon, 12 Oct 2026 21:32:47 +0300
 Subject: [PATCH] feat: import raw ed25519 private keys
 
 ---
- src/engine/encrypted_comment.rs | 214 ++++++++-
- src/engine/key_history.rs       | 111 ++++-
+ src/engine/encrypted_comment.rs | 372 +++++++++++++++-
+ src/engine/key_history.rs       | 358 ++++++++++++++-
  src/wallet/crypto.rs            |  21 +-
  src/wallet/encrypted_comment.rs |  10 +-
  src/wallet/key_rotation.rs      |  22 +-
  src/wallet/mod.rs               |   8 +
  src/wallet/private_key.rs       | 760 ++++++++++++++++++++++++++++++++
- 7 files changed, 1117 insertions(+), 29 deletions(-)
+ 7 files changed, 1517 insertions(+), 34 deletions(-)
  create mode 100644 src/wallet/private_key.rs
 
 diff --git a/src/engine/encrypted_comment.rs b/src/engine/encrypted_comment.rs
-index 6ccff23c3dfb4872b00893de87e1a26a287fb64f..5b23319bbfb0db8e17d3438dda73b621d4c03e67 100644
+index 6ccff23c3dfb4872b00893de87e1a26a287fb64f..76881220ada85ad7c6773de83bfa797ecdcd8aee 100644
 --- a/src/engine/encrypted_comment.rs
 +++ b/src/engine/encrypted_comment.rs
 @@ -1,6 +1,7 @@
@@ -26,7 +26,7 @@ index 6ccff23c3dfb4872b00893de87e1a26a287fb64f..5b23319bbfb0db8e17d3438dda73b621
  
  use crate::domain::{SecretAccessReason, bounded_diagnostic};
  use crate::transport::build_toncenter_v2_request;
-@@ -10,11 +11,12 @@ use crate::wallet::encrypted_comment::{
+@@ -10,16 +11,18 @@ use crate::wallet::encrypted_comment::{
      encrypt_comment as encrypt_body, validate_encrypted_comment_body,
  };
  use crate::wallet::key_history::{KeyChange, recover_signing_keys};
@@ -41,7 +41,14 @@ index 6ccff23c3dfb4872b00893de87e1a26a287fb64f..5b23319bbfb0db8e17d3438dda73b621
  };
  
  use super::WalletClient;
-@@ -274,6 +276,75 @@ impl WalletClient {
+ use super::key_history::{
+-    MAX_KEY_CHANGE_PAGES, build_key_change_request, history_reaches, parse_key_change_page,
++    MAX_KEY_CHANGE_PAGES, build_key_change_message_request, build_key_change_request,
++    history_reaches, parse_key_change_message, parse_key_change_page,
+ };
+ use super::provider::parse_account;
+ use super::send_http::{PublicKeyAnswer, build_public_key_request, parse_public_key};
+@@ -274,6 +277,75 @@ impl WalletClient {
      }
  }
  
@@ -117,7 +124,57 @@ index 6ccff23c3dfb4872b00893de87e1a26a287fb64f..5b23319bbfb0db8e17d3438dda73b621
  impl WalletClient {
      /// Returns this wallet's key-change history while `generation` holds the
      /// resolution slot.
-@@ -1682,4 +1753,143 @@ mod tests {
+@@ -318,7 +390,16 @@ impl WalletClient {
+             })?;
+             offset = offset.saturating_add(page.raw_count);
+             let has_more = page.has_more();
+-            changes.extend(page.changes);
++            let mut page_changes = page.changes;
++            for (index, message_hash) in page.pending {
++                let change = self
++                    .key_change_from_message(generation, &message_hash)
++                    .await?;
++                if let Some(slot) = page_changes.get_mut(index) {
++                    *slot = change;
++                }
++            }
++            changes.extend(page_changes);
+             if !has_more {
+                 break;
+             }
+@@ -331,6 +412,31 @@ impl WalletClient {
+         state.key_changes = Some(changes.clone());
+         Ok(changes)
+     }
++
++    /// Reads one rotation's keys from the transaction its request message started.
++    async fn key_change_from_message(
++        &self,
++        generation: u64,
++        message_hash: &str,
++    ) -> Result<KeyChange, WalletClientError> {
++        let (request, address) = {
++            let built = self.lock().and_then(|mut state| {
++                if !state.is_current(OperationFamily::Resolution, generation) {
++                    return Err(WalletClientError::StateUnavailable);
++                }
++                let id = state.allocate_request_id()?;
++                let request = build_key_change_message_request(&state.config, id, message_hash)?;
++                Ok((request, state.config.address.clone()))
++            });
++            built.inspect_err(|_| self.discard_encrypted_comment_operation(generation))?
++        };
++        let body = self
++            .execute_encrypted_comment_request(generation, &request)
++            .await?;
++        parse_key_change_message(&body, &address).map_err(|error| {
++            self.fail_encrypted_comment_lookup(generation, error.developer_message)
++        })
++    }
+ }
+ 
+ impl WalletClient {
+@@ -1682,4 +1788,262 @@ mod tests {
          assert!(http.urls().is_empty());
          assert_eq!(platform.reads(), 0, "shape errors never read the secret");
      }
@@ -260,15 +317,308 @@ index 6ccff23c3dfb4872b00893de87e1a26a287fb64f..5b23319bbfb0db8e17d3438dda73b621
 +        assert!(http.urls().is_empty());
 +        assert!(slot_released(&client));
 +    }
++
++    /// Answers like Telegram's proxied indexer: rotations without keys, and
++    /// the executed request bodies by external message hash.
++    struct KeylessHost {
++        actions: Vec<u8>,
++        bodies: Vec<(String, Vec<u8>)>,
++        requests: Mutex<Vec<HttpRequest>>,
++    }
++
++    #[async_trait::async_trait]
++    impl WalletHttpHost for KeylessHost {
++        async fn execute_http(&self, request: HttpRequest) -> Result<HttpResponse, HttpHostError> {
++            self.requests
++                .lock()
++                .expect("request lock")
++                .push(request.clone());
++            let body = if request.url.contains("/api/v3/actions?") {
++                self.actions.clone()
++            } else {
++                self.bodies
++                    .iter()
++                    .find(|(hash, _)| request.url.contains(hash.as_str()))
++                    .map(|(_, body)| body.clone())
++                    .expect("a scripted transaction")
++            };
++            Ok(response(request, 200, body))
++        }
++
++        async fn cancel_http(&self, _request_id: HttpRequestId) {}
++    }
++
++    fn keyless_rotation(wallet: &TonAddressString, message_hash: &str) -> serde_json::Value {
++        serde_json::json!({
++            "success": true,
++            "type": "change_wallet_key",
++            "trace_external_hash": message_hash,
++            "details": { "source": null, "destination": wallet.as_str() }
++        })
++    }
++
++    fn executed_request(wallet: &TonAddressString, old: &SigningKey, new: &SigningKey) -> Vec<u8> {
++        use base64::Engine as _;
++        use base64::engine::general_purpose::STANDARD;
++        use ton::ton_core::cell::TonCell;
++        use ton::ton_core::traits::tlb::TLB as _;
++
++        use crate::wallet::key_history::encrypt_old_private_key;
++
++        let mut proof = TonCell::builder();
++        proof.write_bits([7_u8; 64], 512).expect("proof writes");
++        let mut encrypted = TonCell::builder();
++        encrypted
++            .write_bits(encrypt_old_private_key(old, new), 256)
++            .expect("old key writes");
++        let mut request = TonCell::builder();
++        request
++            .write_bits([9_u8; 64], 512)
++            .expect("signature writes");
++        for field in [0xfbba_99c8_u32, 0x7fff_7ffd, 0x7100_0000, 1] {
++            request.write_num(&field, 32).expect("header writes");
++        }
++        request
++            .write_bits(new.verifying_key().to_bytes(), 256)
++            .expect("key writes");
++        request
++            .write_ref(proof.build().expect("proof"))
++            .expect("proof ref");
++        request
++            .write_ref(encrypted.build().expect("old key"))
++            .expect("old key ref");
++        let body = STANDARD.encode(request.build().expect("request").to_boc().expect("boc"));
++        serde_json::to_vec(&serde_json::json!({
++            "transactions": [{
++                "account": wallet.as_str(),
++                "in_msg": { "message_content": { "body": body } }
++            }]
++        }))
++        .expect("transactions JSON")
++    }
++
++    #[test]
++    fn a_history_without_keys_is_read_from_the_executed_requests() {
++        let keys = history::keys();
++        let wallet = client_config().address;
++        let http = Arc::new(KeylessHost {
++            actions: history::page(vec![
++                keyless_rotation(&wallet, "newest+hash="),
++                keyless_rotation(&wallet, "oldest+hash="),
++            ]),
++            bodies: vec![
++                (
++                    "newest%2Bhash%3D".to_owned(),
++                    executed_request(&wallet, &keys.lost, &keys.current),
++                ),
++                (
++                    "oldest%2Bhash%3D".to_owned(),
++                    executed_request(&wallet, &keys.anchor, &keys.lost),
++                ),
++            ],
++            requests: Mutex::new(Vec::new()),
++        });
++        let config = WalletClientConfig {
++            public_key: keys.current.verifying_key().to_bytes().to_vec(),
++            local_secret_ref: None,
++            ..client_config()
++        };
++        let client = WalletClient::new(config, http.clone(), history::PhraseHost::new(""))
++            .expect("client builds");
++        let words = half_words(&keys.current_phrase, 12);
++
++        let secret = block_on(client.recover_wallet_secret(words.clone()))
++            .expect("the request bodies rebuild the secret");
++
++        let (anchor, rest) = secret.phrase.split_once(' ').expect("key and words");
++        assert_eq!(anchor, hex_of(keys.anchor.as_bytes()));
++        assert_eq!(rest, words.join(" "));
++        assert_eq!(http.requests.lock().expect("request lock").len(), 3);
++        assert!(slot_released(&client));
++    }
  }
 diff --git a/src/engine/key_history.rs b/src/engine/key_history.rs
-index a688a68010aceb9886b4007e18699c7163de868e..d570dbd9c58f76957c1290aad17aa06b1c04440e 100644
+index a688a68010aceb9886b4007e18699c7163de868e..e84404b82f39b274c525fa9249af383d1fa47c28 100644
 --- a/src/engine/key_history.rs
 +++ b/src/engine/key_history.rs
-@@ -137,18 +137,62 @@ pub(super) fn parse_key_change_page(
-     Ok(KeyChangePage { changes, raw_count })
+@@ -37,6 +37,8 @@ struct RawAction {
+     success: Option<bool>,
+     #[serde(default)]
+     details: Value,
++    #[serde(default)]
++    trace_external_hash: Option<String>,
  }
  
+ #[derive(Debug, Deserialize)]
+@@ -56,6 +58,10 @@ pub(super) struct KeyChangePage {
+     pub(super) changes: Vec<KeyChange>,
+     /// The number of actions the provider returned, including skipped ones.
+     pub(super) raw_count: usize,
++    /// Rotations whose keys the provider left out, as an index into `changes`
++    /// and the hash of the external message that requested them. Those
++    /// entries are placeholders until the keys are read from that message.
++    pub(super) pending: Vec<(usize, String)>,
+ }
+ 
+ impl KeyChangePage {
+@@ -99,8 +105,10 @@ pub(super) fn build_key_change_request(
+ /// Failed rotations, other action types, and rotations of other wallets are
+ /// skipped: an account filter also returns actions this wallet only relayed.
+ /// Toncenter indexer v1.3 reports a rotation only together with its key-changed
+-/// log, so a rotation of this wallet without both keys is a provider protocol
+-/// error.
++/// log. Older indexers, such as the one Telegram proxies, report neither key;
++/// such a rotation is kept as a placeholder with its external message hash in
++/// `pending`. A rotation of this wallet with one key, or without both keys and
++/// without that hash, is a provider protocol error.
+ pub(super) fn parse_key_change_page(
+     body: &[u8],
+     wallet: &TonAddressString,
+@@ -109,6 +117,7 @@ pub(super) fn parse_key_change_page(
+         .map_err(|error| invalid_response(format!("invalid key-change actions: {error}")))?;
+     let raw_count = response.actions.len();
+     let mut changes = Vec::new();
++    let mut pending = Vec::new();
+     for action in response.actions {
+         if action.kind != CHANGE_WALLET_KEY_ACTION || action.success != Some(true) {
+             continue;
+@@ -126,6 +135,17 @@ pub(super) fn parse_key_change_page(
+         if destination.as_address() != wallet.as_address() {
+             continue;
+         }
++        if details.new_public_key.is_none()
++            && details.encrypted_old_private_key.is_none()
++            && let Some(message_hash) = action.trace_external_hash
++        {
++            pending.push((changes.len(), message_hash));
++            changes.push(KeyChange {
++                new_public_key: [0; 32],
++                encrypted_old_private_key: [0; 32],
++            });
++            continue;
++        }
+         changes.push(KeyChange {
+             new_public_key: parse_key_hex(details.new_public_key, "new_public_key")?,
+             encrypted_old_private_key: parse_key_hex(
+@@ -134,21 +154,176 @@ pub(super) fn parse_key_change_page(
+             )?,
+         });
+     }
+-    Ok(KeyChangePage { changes, raw_count })
++    Ok(KeyChangePage {
++        changes,
++        raw_count,
++        pending,
++    })
++}
++
++#[derive(Debug, Deserialize)]
++struct MessageTransactionsResponse {
++    #[serde(default)]
++    transactions: Vec<MessageTransaction>,
+ }
+ 
++#[derive(Debug, Deserialize)]
++struct MessageTransaction {
++    account: String,
++    #[serde(default)]
++    in_msg: Option<InboundMessage>,
++}
++
++#[derive(Debug, Deserialize)]
++struct InboundMessage {
++    #[serde(default)]
++    message_content: Option<MessageContent>,
++}
++
++#[derive(Debug, Deserialize)]
++struct MessageContent {
++    #[serde(default)]
++    body: Option<String>,
++}
++
++/// Builds the lookup of the transaction a rotation request message started.
++pub(super) fn build_key_change_message_request(
++    config: &WalletClientConfig,
++    id: HttpRequestId,
++    message_hash: &str,
++) -> Result<HttpRequest, crate::WalletClientError> {
++    build_toncenter_v3_request(
++        config,
++        id,
++        "transactionsByMessage",
++        &[
++            ("msg_hash", message_hash),
++            ("direction", "in"),
++            ("limit", "1"),
++            ("offset", "0"),
++        ],
++    )
++}
++
++/// Reads one rotation's keys from the request the wallet executed.
++///
++/// The inbound body of this wallet's transaction is the signed change-key
++/// request: signature, opcode, wallet id, expiration, sequence number and the
++/// new public key, then the new key's proof and the encrypted old private key
++/// as its two references.
++pub(super) fn parse_key_change_message(
++    body: &[u8],
++    wallet: &TonAddressString,
++) -> Result<KeyChange, DomainError> {
++    use base64::Engine as _;
++    use base64::engine::general_purpose::STANDARD;
++    use ton::ton_core::cell::TonCell;
++    use ton::ton_core::traits::tlb::TLB as _;
++
++    let malformed = |what: &str| invalid_response(format!("key-change transaction: {what}"));
++    let response: MessageTransactionsResponse =
++        serde_json::from_slice(body).map_err(|error| malformed(&error.to_string()))?;
++    let transaction = response
++        .transactions
++        .into_iter()
++        .next()
++        .ok_or_else(|| malformed("not indexed yet"))?;
++    let account = TonAddressString::try_from(transaction.account)
++        .map_err(|_| malformed("invalid account"))?;
++    if account.as_address() != wallet.as_address() {
++        return Err(malformed("executed by another account"));
++    }
++    let request = transaction
++        .in_msg
++        .and_then(|message| message.message_content)
++        .and_then(|content| content.body)
++        .ok_or_else(|| malformed("no inbound body"))?;
++    let request = STANDARD
++        .decode(request.trim())
++        .map_err(|_| malformed("inbound body is not base64"))?;
++    let cell = TonCell::from_boc(request).map_err(|_| malformed("inbound body is not a BoC"))?;
++    let mut parser = cell.parser();
++    let read = || malformed("not a change-key request");
++    let _signature = parser.read_bits(512).map_err(|_| read())?;
++    let opcode = parser.read_num::<u32>(32).map_err(|_| read())?;
++    if opcode != CHANGE_KEY_EXTERNAL_OPCODE && opcode != CHANGE_KEY_INTERNAL_OPCODE {
++        return Err(read());
++    }
++    for _ in 0..3 {
++        let _field = parser.read_num::<u32>(32).map_err(|_| read())?;
++    }
++    let new_public_key =
++        <[u8; 32]>::try_from(parser.read_bits(256).map_err(|_| read())?).map_err(|_| read())?;
++    let _proof = parser.read_next_ref().map_err(|_| read())?;
++    let encrypted = parser.read_next_ref().map_err(|_| read())?;
++    let encrypted_old_private_key =
++        <[u8; 32]>::try_from(encrypted.parser().read_bits(256).map_err(|_| read())?)
++            .map_err(|_| read())?;
++    Ok(KeyChange {
++        new_public_key,
++        encrypted_old_private_key,
++    })
++}
++
++const CHANGE_KEY_EXTERNAL_OPCODE: u32 = 0xfbba_99c8;
++const CHANGE_KEY_INTERNAL_OPCODE: u32 = 0xfbba_99c7;
++
 +/// Reads a 32-byte key of a `change_wallet_key` action.
 +///
 +/// Toncenter reports keys as 64 hex digits, while other indexer deployments,
@@ -336,7 +686,7 @@ index a688a68010aceb9886b4007e18699c7163de868e..d570dbd9c58f76957c1290aad17aa06b
  }
  
  #[cfg(test)]
-@@ -326,6 +370,57 @@ mod tests {
+@@ -326,6 +501,167 @@ mod tests {
          }
      }
  
@@ -389,6 +739,116 @@ index a688a68010aceb9886b4007e18699c7163de868e..d570dbd9c58f76957c1290aad17aa06b
 +            "{}",
 +            error.developer_message
 +        );
++    }
++
++    /// A signed change-key request body as base64, as an indexer reports it.
++    pub(crate) fn request_body(
++        new_public_key: [u8; 32],
++        encrypted: [u8; 32],
++        opcode: u32,
++    ) -> String {
++        use base64::Engine as _;
++        use base64::engine::general_purpose::STANDARD;
++        use ton::ton_core::cell::TonCell;
++        use ton::ton_core::traits::tlb::TLB as _;
++
++        let mut proof = TonCell::builder();
++        proof.write_bits([7_u8; 64], 512).expect("proof writes");
++        let mut old = TonCell::builder();
++        old.write_bits(encrypted, 256).expect("old key writes");
++        let mut request = TonCell::builder();
++        request
++            .write_bits([9_u8; 64], 512)
++            .expect("signature writes");
++        request.write_num(&opcode, 32).expect("opcode writes");
++        for field in [0x7fff_7f11_u32, 0x7100_0000, 3] {
++            request.write_num(&field, 32).expect("header writes");
++        }
++        request.write_bits(new_public_key, 256).expect("key writes");
++        request
++            .write_ref(proof.build().expect("proof builds"))
++            .expect("proof ref");
++        request
++            .write_ref(old.build().expect("old key builds"))
++            .expect("old key ref");
++        STANDARD.encode(
++            request
++                .build()
++                .expect("request builds")
++                .to_boc()
++                .expect("boc"),
++        )
++    }
++
++    pub(crate) fn transactions(account: &str, body: &str) -> Vec<u8> {
++        serde_json::to_vec(&json!({
++            "transactions": [{
++                "account": account,
++                "hash": "ybABMr+c9dJPt7wFMfUQyjd9HmweAIBz77Ym9Bh3M7Y=",
++                "lt": "99612240000002",
++                "in_msg": {
++                    "hash": "+kW8nTZkdkT6dkI2SfB9nxbiYoSYmTGIFjfa7veogkw=",
++                    "message_content": { "hash": "x", "body": body, "decoded": null }
++                }
++            }],
++            "address_book": {}
++        }))
++        .expect("transactions JSON")
++    }
++
++    #[test]
++    fn rotations_without_keys_wait_for_their_request_message() {
++        let mut keyless = action(
++            "change_wallet_key",
++            json!(true),
++            json!({ "source": null, "destination": WALLET }),
++        );
++        keyless["trace_external_hash"] = json!("+kW8nTZkdkT6dkI2SfB9nxbiYoSYmTGIFjfa7veogkw=");
++        let body = page(vec![
++            rotation(WALLET, json!(NEW_KEY), json!(ENCRYPTED)),
++            keyless,
++        ]);
++
++        let page = parse_key_change_page(&body, &wallet()).expect("page parses");
++
++        assert_eq!(page.changes.len(), 2);
++        assert_eq!(page.changes[0].new_public_key, bytes(NEW_KEY));
++        assert_eq!(
++            page.pending,
++            vec![(1, "+kW8nTZkdkT6dkI2SfB9nxbiYoSYmTGIFjfa7veogkw=".to_owned())]
++        );
++    }
++
++    #[test]
++    fn the_executed_request_gives_both_keys() {
++        let key = bytes(NEW_KEY);
++        let encrypted = bytes(ENCRYPTED);
++        for opcode in [CHANGE_KEY_EXTERNAL_OPCODE, CHANGE_KEY_INTERNAL_OPCODE] {
++            let body = transactions(WALLET, &request_body(key, encrypted, opcode));
++            assert_eq!(
++                parse_key_change_message(&body, &wallet()).expect("request parses"),
++                KeyChange {
++                    new_public_key: key,
++                    encrypted_old_private_key: encrypted,
++                }
++            );
++        }
++
++        for body in [
++            transactions(
++                RELAYER,
++                &request_body(key, encrypted, CHANGE_KEY_EXTERNAL_OPCODE),
++            ),
++            transactions(WALLET, &request_body(key, encrypted, 0x0f8a_7ea5)),
++            transactions(WALLET, "not base64!"),
++            serde_json::to_vec(&json!({ "transactions": [] })).expect("JSON"),
++        ] {
++            assert!(
++                parse_key_change_message(&body, &wallet()).is_err(),
++                "{}",
++                String::from_utf8_lossy(&body)
++            );
++        }
 +    }
 +
      #[test]
